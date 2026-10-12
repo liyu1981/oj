@@ -163,6 +163,26 @@ async function main() {
     return resolve(APP, "src/router.tsx");
   }
 
+  // `#tanstack-start-entry` resolves to the app's `src/start.*` exactly as
+  // upstream's resolveEntry does (`startFilePath ?? defaultEntryPaths.start`),
+  // falling back to the stub that mirrors the framework's default entry
+  // (`export const startInstance = undefined`). The client needs the real file
+  // too: `functionMiddleware` wraps server-fn calls in the browser.
+  function startEntry() {
+    try {
+      const target = JSON.parse(readFileSync(resolve(APP, "package.json"), "utf8")).imports?.["#tanstack-start-entry"];
+      if (typeof target === "string") {
+        const p = resolve(APP, target);
+        if (existsSync(p)) return p;
+      }
+    } catch {}
+    for (const ext of [".ts", ".js", ".mts", ".mjs", ".tsx", ".jsx"]) {
+      const p = resolve(APP, "src/start" + ext);
+      if (existsSync(p)) return p;
+    }
+    return join(HERE, "start-entry.ts");
+  }
+
   function serverFns(code) {
     const re = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\(/g;
     const out = [];
@@ -253,9 +273,10 @@ async function main() {
 
   const clientAlias = {
     "#tanstack-router-entry": routerEntry(),
-    "#tanstack-start-entry": join(HERE, "start-entry.ts"),
+    "#tanstack-start-entry": startEntry(),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
     "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
+    "tanstack-start-injected-head-scripts:v": join(HERE, "injected-head-scripts.ts"),
     "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   };
 
@@ -344,14 +365,21 @@ async function main() {
     await clientContainer.writeBundle(bundle);
   }
 
+  // The SERVER bundle bakes this rewrite in (serverAlias maps the manifest
+  // virtual to the same file, and the server build runs after this write), so
+  // it must serve the same shape union as the static shims: 1.168+ reads
+  // per-route `scripts`/`css`, 1.167 and earlier read the top-level
+  // `clientEntry` (`import(undefined)` without it) and css from per-route
+  // `assets`. Each version copies only the fields it knows.
   const rootManifest = {
     preloads: [clientUrl],
     css: emit.cssUrls(),
     scripts: [{ attrs: { type: "module", async: true, src: clientUrl } }],
+    assets: emit.cssUrls().map((href) => ({ tag: "link", attrs: { rel: "stylesheet", href } })),
   };
   writeFileSync(
     join(HERE, "manifest.ts"),
-    `export const tsrStartManifest = () => (${JSON.stringify({ routes: { __root__: rootManifest } })});\n`,
+    `export const tsrStartManifest = () => (${JSON.stringify({ routes: { __root__: rootManifest }, clientEntry: clientUrl })});\n`,
   );
 
   const serverDefine = {
