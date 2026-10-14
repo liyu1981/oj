@@ -64,7 +64,12 @@ mod html;
 pub mod tls;
 pub use html::*;
 mod ssr;
+mod style_file;
 pub use ssr::*;
+pub use style_file::{
+    compile_style_file, needs_css_compile, needs_preprocess_engine, start_dev_inline_style,
+    StyleInputs, StyleModule,
+};
 mod middleware;
 mod preview;
 mod proxy;
@@ -1515,6 +1520,7 @@ impl DevServer {
             targets: oj_config::build_css_targets(&config),
             minify: false,
             modules: css_modules_options(&config),
+            lightning: css_lightning_options(&config),
         };
         let state = Arc::new(ServerState {
             persistent_cache,
