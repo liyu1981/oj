@@ -35,6 +35,7 @@ mod hmr_protocol;
 mod host_binding;
 mod html_entry;
 mod html_env;
+mod html_proxy;
 mod jsx_import_source;
 mod lazy_flag;
 mod lingui_macro_shim;
