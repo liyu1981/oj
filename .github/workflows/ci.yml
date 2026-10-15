@@ -25,18 +25,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # The optimizer, config-extraction and Start alias tests run the real
+      # vite/rolldown (and the config loader's esbuild) from the start-app
+      # fixture and skip without it, so it installs BEFORE the cargo run.
+      # One workspace run only: a second `-p` scoped run resolves features
+      # differently and rebuilt v8, which then could not find the rusty_v8
+      # archive in the restored cache.
+      - name: install start-app fixture (bundlers for optimizer + config tests)
+        run: npm ci --prefix e2e/fixtures/start-app
       # Release, not debug: the tests must exercise the codegen that ships.
       # A debug-only suite stayed green through a release-only engine
       # miscompilation (every job on an uncapped isolate failed MemoryLimit).
       - run: cargo test --workspace --release
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-      # The optimizer + sidecar-harness unit tests run the real vite/rolldown
-      # (and the config loader's esbuild) from the start-app fixture; install
-      # it so they run instead of skipping.
-      - name: install start-app fixture (bundlers for optimizer + config tests)
-        run: npm ci --prefix e2e/fixtures/start-app
       - name: js unit tests (adapter helpers)
         run: node --test e2e/unit/*.test.mjs
       - name: fuzz targets still build
@@ -274,6 +277,8 @@ jobs:
         run: node e2e/start-node-modules-ts.mjs
       - name: start dev ssr ignores the browser main field, the client bundle keeps it
         run: node e2e/start-ssr-browser-field.mjs
+      - name: start dev and build client bundles apply the app's resolve.alias to every importer
+        run: node e2e/start-app-alias.mjs
       - name: start dev ssr renders route, module and css module edits
         run: node e2e/start-ssr-hmr.mjs
       - name: start css modules scope the same class on server, client and stylesheet
