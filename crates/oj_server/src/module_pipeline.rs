@@ -372,16 +372,23 @@ fn compile_key(
     let mode = if is_server { "server" } else { "dev" };
     // Fold the newest HMR stamp among imports into the key: an unchanged importer
     // must recompile after a dep update so its import carries the new `?t=`.
-    let imports_stamp = state
-        .graph
-        .lock()
-        .unwrap()
-        .imports_timestamp(Path::new(url));
+    let (imports_stamp, invalidated) = {
+        let graph = state.graph.lock().unwrap();
+        (
+            graph.imports_timestamp(Path::new(url)),
+            graph.invalidation_timestamp(Path::new(url)),
+        )
+    };
     let mut mode_key = if imports_stamp > 0 {
         format!("{mode}@{imports_stamp}")
     } else {
         mode.to_string()
     };
+    // A file change hard-invalidated it (a stylesheet whose inlined dep
+    // changed): the next request re-transforms, HMR on or off.
+    if invalidated > 0 {
+        mode_key.push_str(&format!("+inv{invalidated}"));
+    }
     // tsconfig class-field semantics change the output, so they are part of the key.
     let class_field_semantics = oj_compiler::tsconfig::class_field_set_semantics(file);
     if class_field_semantics {
@@ -564,8 +571,20 @@ async fn css_prepass(
         &mut css.deps,
     )?;
     css.imports_inlined = true;
-    Ok(match run_css_engine(state, url, &source).await {
-        Ok(out) => out,
+    let compiled = match lazy_engine(state, EngineKind::Tailwind).await {
+        Ok(engine) => engine.compile_tracked(&source, url).await,
+        Err(e) => Err(e),
+    };
+    Ok(match compiled {
+        Ok((out, deps)) => {
+            // The PostCSS deps join the sheet's graph imports, as Vite's
+            // compileCSS adds them to the module's watch files.
+            let files = tokio::task::spawn_blocking(move || css_dep_files(deps, None))
+                .await
+                .unwrap_or_default();
+            css.deps.extend(files);
+            out
+        }
         Err(e) => {
             eprintln!("oj: postcss failed for {url}: {e}");
             source
@@ -647,12 +666,19 @@ impl CompileJob {
             .unwrap_or(false);
         let output = oj_css::compile_css_dev(&self.url, &css_src, dev_sourcemap, &resolve)?;
         // Pulled-in files enter the graph as this sheet's imports so a dep edit
-        // hot-updates it; filter the sheet itself (a self-edge is a bogus cycle).
+        // hot-updates it, `/@fs/` ones outside the root watched as Vite's
+        // ensureWatchedFile does; filter the sheet itself (a self-edge is a
+        // bogus cycle). Normalized first: an `@import "../../x.css"` target
+        // keeps its `..`s, under the root by spelling only.
         let root = &state.root;
         let mut dep_imports: Vec<String> = css_deps
             .iter()
-            .filter(|p| p.starts_with(root) && **p != self.file)
-            .map(|p| url_of(root, p))
+            .map(|p| normalize(p))
+            .filter(|p| *p != self.file)
+            .map(|p| {
+                ensure_watched_file(state, &p);
+                url_of(root, &p)
+            })
             .collect();
         dep_imports.sort();
         dep_imports.dedup();

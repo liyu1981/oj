@@ -8,7 +8,7 @@
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const processors = new Map();
 
@@ -149,24 +149,65 @@ async function loadPostcss(base, cfgPath) {
   return processor;
 }
 
-// Tailwind v4: no PostCSS plugin, compile through @tailwindcss/node + scan
-// class candidates with @tailwindcss/oxide (both transitive dependencies of
-// whichever tailwind package the app installed).
+// Tailwind v4 with no PostCSS config, compiled as @tailwindcss/postcss does:
+// `@import` / `@source` resolve from the sheet's own directory, the scan covers
+// `source(...)` (the root, `**/*` when unset) plus every `@source`, and the
+// scanner's files and globs are the sheet's dependencies. Both packages are
+// transitive dependencies of whichever tailwind package the app installed.
 async function v4Compile(base, css, from) {
   const anchors = ["@tailwindcss/vite", "@tailwindcss/postcss", "tailwindcss"];
   const tw = await importPkg(base, "@tailwindcss/node", anchors, "tailwindcss");
   const oxide = await importPkg(base, "@tailwindcss/oxide", anchors, "tailwindcss");
-  const compiler = await tw.compile(css, { base, from, onDependency: () => {} });
-  const scanner = new oxide.Scanner({ sources: [{ base, pattern: "**/*", negated: false }] });
-  return compiler.build(scanner.scan());
+  const deps = [];
+  const dirDeps = [];
+  const compiler = await tw.compile(css, {
+    base: from ? dirname(from) : base,
+    from,
+    onDependency: (path) => deps.push(path),
+  });
+  const scanner = new oxide.Scanner({ sources: v4Sources(base, compiler) });
+  const candidates = scanner.scan();
+  for (const file of scanner.files) {
+    if (file !== from) deps.push(file);
+  }
+  for (const { base: dir, pattern } of scanner.globs) {
+    if (pattern === "*" && dir === base) continue;
+    if (pattern === "") deps.push(resolve(dir));
+    else dirDeps.push({ dir: resolve(dir), glob: pattern });
+  }
+  return { css: compiler.build(candidates), deps, dirDeps };
 }
 
+// The scanner's sources for a compiled sheet. Before 4.1 the compiler named
+// its `@source` entries `globs`, with no negation.
+function v4Sources(base, compiler) {
+  const root =
+    compiler.root === "none"
+      ? []
+      : compiler.root == null
+        ? [{ base, pattern: "**/*", negated: false }]
+        : [{ ...compiler.root, negated: false }];
+  const sources = compiler.sources ?? (compiler.globs ?? []).map((g) => ({ ...g, negated: false }));
+  return root.concat(sources);
+}
+
+// The sheet's css plus what it read, as Vite's compileCSS collects PostCSS
+// `dependency` / `dir-dependency` messages for the dev watcher.
 export async function compile(request) {
   const { base, css, from } = request;
   const processor = await loadPostcss(base, request.postcssConfig || null);
   if (processor) {
     const result = await processor.process(css, { from, map: false });
-    return result.css;
+    const deps = [];
+    const dirDeps = [];
+    for (const message of result.messages) {
+      if (message.type === "dependency") {
+        deps.push(message.file);
+      } else if (message.type === "dir-dependency") {
+        dirDeps.push({ dir: resolve(dirname(from), message.dir), glob: message.glob || "**" });
+      }
+    }
+    return { css: result.css, deps, dirDeps };
   }
   return v4Compile(base, css, from);
 }

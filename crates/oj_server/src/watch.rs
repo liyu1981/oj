@@ -680,9 +680,11 @@ fn handle_batch(
 ) {
     // Config/.env can't be hot-applied (read once at startup): restart, as
     // Vite does, naming the file relative to the launch dir as Vite's
-    // "<file> changed, restarting server" does.
+    // "<file> changed, restarting server" does. Vite restarts from
+    // handleHMRUpdate, so not with `server.hmr: false`.
     if let Some(file) = paths
         .iter()
+        .filter(|_| state.hmr_enabled)
         .find(|p| is_restart_trigger(p) || is_config_dependency(p))
     {
         let shown = STARTUP_CWD
@@ -702,16 +704,25 @@ fn handle_batch(
             .reload_tx
             .send(full_reload_frame("tsconfig change", None, None));
     }
-    if !state.hmr_enabled {
-        return;
+    // Vite's watcher, per change: plugin watchChange, then the module graph
+    // invalidation, then HMR, which `server.hmr: false` skips and the editor
+    // gate holds until its flush. The first two run either way. A Tailwind
+    // sheet is dropped at once, as it carries no plugin state.
+    if !paths.is_empty() {
+        state.tailwind_sheets.invalidate();
     }
-    if let Some(gate) = &state.hmr_gate {
-        if gate.hold(state, paths, false) {
-            return;
-        }
-    }
+    let dispatch = state.hmr_enabled
+        && !state
+            .hmr_gate
+            .as_ref()
+            .is_some_and(|gate| gate.hold(state, paths, false));
     let (state, paths, created) = (Arc::clone(state), paths.to_vec(), created.clone());
     state.rt.clone().spawn(async move {
+        run_watch_change(&state, &paths, &created).await;
+        invalidate_changed(&state, &paths);
+        if !dispatch {
+            return;
+        }
         let messages = decide(&state, &paths, &created).await;
         if messages.is_empty() {
             return;
@@ -721,6 +732,29 @@ fn handle_batch(
             let _ = state.reload_tx.send(message);
         }
     });
+}
+
+/// Vite's `moduleGraph.onFileChange` for each edited file: one still on disk
+/// and already in the graph (a first save by rename arrives as a create, a
+/// `change` to chokidar). A hard-invalidated module drops its mtime fast-path
+/// key, so its next request recomputes the cache key, which carries the new
+/// invalidation stamp.
+fn invalidate_changed(state: &ServerState, paths: &[PathBuf]) {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let url = url_of(&state.root, path);
+        let hard = state
+            .graph
+            .lock()
+            .unwrap()
+            .invalidate_on_change(Path::new(&url), |m| !is_style_url(&m.to_string_lossy()));
+        let mut keys = state.mtime_keys.lock().unwrap();
+        for module in hard {
+            keys.remove(&module.display().to_string());
+        }
+    }
 }
 
 pub(crate) fn spawn_watcher(
