@@ -1214,22 +1214,56 @@ function configure(input) {
   ];
 }
 
-/// The dep scan alone, run inside the plugin host so every import resolves
+/// The dep scan, run inside the plugin host so every import resolves
 /// through the app's plugins first (Vite's scan goes through
 /// `pluginContainer.resolveId(..., { scan: true })`) and the config's live
 /// `optimizeDeps.rolldownOptions.plugins` take part. Only the scan runs there:
-/// a dep bundle in that long-lived isolate keeps hundreds of MB resident. The
-/// result feeds `optimize()` as `scanned`.
-export async function scan(input, host) {
+/// a dep bundle in that long-lived isolate keeps hundreds of MB resident, so
+/// nothing here bundles or requires a dep. `scanned` feeds `optimize()`.
+///
+/// With `input.plan` (the initial run only) it also returns `provisional`,
+/// the metadata the bundle is going to commit, guessed before bundling
+/// (Vite's discovered-deps optimization: file names are known up front,
+/// interop is read off each entry's source). The dev server serves source
+/// modules against it while the bundle runs, so a cold boot's first compiles
+/// wait for the scan, not the whole pre-bundle; a commit that disagrees with
+/// a guess reloads the page.
+export async function scanPlan(input, host) {
   configure(input);
   const rd = await loadRolldown(pickRolldown(root, input.vendoredRolldown));
-  return Object.fromEntries(await rolldownScan(rd, autoDiscover, host));
+  const candidates = await rolldownScan(rd, autoDiscover, host);
+  const scanned = Object.fromEntries(candidates);
+  if (!input.plan) return { scanned };
+  const { entryPoints, nameOf } = planEntries(new Map(candidates), { warn: false });
+  const provisional = {};
+  for (const [dep, name] of Object.entries(nameOf)) {
+    const cjs = entryIsCommonJs(rd.parseSync, entryPoints[name]);
+    // A CJS react-family dep gets the named facade; one with no names to
+    // facade (rare) bundles plain and the commit reloads.
+    if (cjs && DEDUPE.has(dep)) {
+      provisional[dep] = { file: `${name}__oj_named.mjs`, needsInterop: NEEDS_INTEROP.has(dep) };
+    } else {
+      provisional[dep] = { file: `${name}.mjs`, needsInterop: cjs || NEEDS_INTEROP.has(dep) };
+    }
+  }
+  return { scanned, provisional };
 }
 
-export async function optimize(input) {
-  configure(input);
-  const rd = await loadRolldown(pickRolldown(root, input.vendoredRolldown));
-  const candidates = input.scanned ? new Map(Object.entries(input.scanned)) : await rolldownScan(rd, autoDiscover);
+/// An entry with no ESM syntax: the bundle's own verdict for one
+/// (entryNeedsInterop) before its output exists.
+function entryIsCommonJs(parseSync, file) {
+  if (!parseSync || !file || !path.isAbsolute(file)) return false;
+  try {
+    return !parseSync(file, readFileSync(file, "utf8")).module.hasModuleSyntax;
+  } catch {
+    return false;
+  }
+}
+
+/// Which scanned deps the pre-bundle takes, and the entry name each bundles
+/// under: `{ entryPoints, nameOf }`. `warn` is off for the provisional plan,
+/// which the bundle repeats.
+function planEntries(candidates, { warn = true } = {}) {
   // "a > b" names a nested copy the scan cannot resolve (it resolves below),
   // and a plain include the scan could not resolve must reach the loop too,
   // so its unableToOptimize warning fires instead of a silent drop.
@@ -1241,7 +1275,7 @@ export async function optimize(input) {
   // Vite's unableToOptimize: a dep named in `optimizeDeps.include` that does
   // not resolve is dropped with a warning, never silently.
   const unableToOptimize = (dep) => {
-    if (warnIncludes.has(dep) || dep.includes(">")) {
+    if (warn && (warnIncludes.has(dep) || dep.includes(">"))) {
       console.warn(`oj: failed to resolve dependency "${dep}", present in 'optimizeDeps.include'`);
     }
   };
@@ -1318,6 +1352,15 @@ export async function optimize(input) {
     entryPoints[name] = entry;
     nameOf[dep] = name;
   }
+
+  return { entryPoints, nameOf };
+}
+
+export async function optimize(input) {
+  configure(input);
+  const rd = await loadRolldown(pickRolldown(root, input.vendoredRolldown));
+  const candidates = input.scanned ? new Map(Object.entries(input.scanned)) : await rolldownScan(rd, autoDiscover);
+  const { entryPoints, nameOf } = planEntries(candidates);
 
   // A rerun after serve-time discovery keeps the previous bundle's files: a
   // page that predates it still loads its chunks until the reload lands (the
