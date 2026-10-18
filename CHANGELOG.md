@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On a cold deps cache, source compiles start once the dependency scan finishes, not the whole pre-bundle, as Vite's transforms wait only for its scan. Requests for the optimized deps still wait for the bundle, and a bundle that disagrees with the scan's plan reloads the page.
 - A function vite config gets Vite's full config env (`{ mode, command, isSsrBuild, isPreview }`) in every evaluation: the config extraction, the plugin host and the Start plugin bridge each passed a shorter object.
 - `server.hmr: false` no longer restarts the dev server on a config or `.env` change, as in Vite. The change still reaches plugins' `watchChange`.
+- A burst of file changes runs plugins' `watchChange` and `hotUpdate` hooks concurrently, as Vite's watcher handles each change on its own, so a plugin that debounces a burst by awaiting a timer does its work once instead of once per file. This holds for runner-backed environments too. For one file, the client environment's `hotUpdate` now runs before the SSR one's, as in Vite.
 
 ### Fixed
 
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A plugin's `configureServer` runs once per dev server, as in Vite. oj's client and SSR plugin hosts both ran it, so a plugin's server side effects (an event bus, a custom dev environment) started twice.
 - Tailwind v4 compiled by oj (no PostCSS config) honors `@source`, and a stylesheet's dependencies outside the root (an `@source` or `@import` into a sibling package, a file a PostCSS plugin reports) are watched, so editing them refreshes the sheet.
 - A file change invalidates the modules that depend on it whether or not HMR runs, as Vite's watcher does, so with `server.hmr: false` or under the editor gate an `@import`ed sheet's edit reaches its importer.
+- On macOS, a directory watched after boot (a served file's directory outside the root, a top-level directory created later) gets its own FSEvents stream, as Vite's chokidar opens one per watched path. Adding one restarted the watcher's only stream, which dropped changes made meanwhile anywhere under the root and, on a busy machine, held the watcher for minutes.
 
 ## [0.2.36] - 2026-10-16
 
