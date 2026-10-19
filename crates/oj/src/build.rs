@@ -5028,6 +5028,80 @@ fn transitive_imports(
     seen
 }
 
+/// The synchronous chunks of the pages rooted at `entries`, dependency-first:
+/// each chunk's static imports (recursively) precede the chunk itself. This is
+/// the order `vite build` links a page's stylesheets in, so a module stylesheet
+/// can override a vendor one at equal specificity. A chunk reachable from more
+/// than one entry is emitted once, even if the imports form a cycle.
+fn ordered_sync_chunks(
+    entries: &[String],
+    map: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    fn visit(
+        f: &str,
+        map: &std::collections::HashMap<String, Vec<String>>,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if !seen.insert(f.to_string()) {
+            return;
+        }
+        for dep in map.get(f).into_iter().flatten() {
+            visit(dep, map, seen, out);
+        }
+        out.push(f.to_string()); // dependencies before the chunk itself
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in entries {
+        visit(e, map, &mut seen, &mut out);
+    }
+    out
+}
+
+/// The `__vitePreload` deps of a dynamic import of `target`, in Vite's
+/// `addDeps` order (importAnalysisBuild.ts): each chunk as it is reached, its
+/// static imports' deps, then its own stylesheet, so a lazy chunk's CSS lands
+/// after the shared CSS it imports. Chunks in `own` (the importer's) are left out.
+fn preload_deps(
+    target: &str,
+    map: &std::collections::HashMap<String, Vec<String>>,
+    css_of: &std::collections::HashMap<&str, &str>,
+    own: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    fn visit(
+        f: &str,
+        map: &std::collections::HashMap<String, Vec<String>>,
+        css_of: &std::collections::HashMap<&str, &str>,
+        own: &std::collections::BTreeSet<String>,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if own.contains(f) || !seen.insert(f.to_string()) {
+            return;
+        }
+        out.push(f.to_string());
+        for dep in map.get(f).into_iter().flatten() {
+            visit(dep, map, css_of, own, seen, out);
+        }
+        if let Some(css) = css_of.get(f) {
+            out.push(css.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(
+        target,
+        map,
+        css_of,
+        own,
+        &mut std::collections::HashSet::new(),
+        &mut out,
+    );
+    out
+}
+
 fn sanitize_asset_name(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -5269,22 +5343,23 @@ fn split_css_links(
     imports_map: &std::collections::HashMap<String, Vec<String>>,
     page_base: &str,
 ) -> String {
-    let mut sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for entry in entry_files {
-        sync_chunks.insert(entry.clone());
-        sync_chunks.extend(transitive_imports(entry, imports_map));
-    }
-    let mut linked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let css_of: std::collections::HashMap<&str, &str> = chunk_css
+        .iter()
+        .map(|(c, s)| (c.as_str(), s.as_str()))
+        .collect();
+    let mut linked: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut links = String::new();
-    for (chunk_file, css_name) in chunk_css {
-        if sync_chunks.contains(chunk_file) && linked.insert(css_name.clone()) {
-            if !links.is_empty() {
-                links.push('\n');
+    for chunk in ordered_sync_chunks(entry_files, imports_map) {
+        if let Some(css_name) = css_of.get(chunk.as_str()) {
+            if linked.insert(css_name) {
+                if !links.is_empty() {
+                    links.push('\n');
+                }
+                links.push_str(&format!(
+                    "<link rel=\"stylesheet\" href=\"{}\" crossorigin />",
+                    with_base(css_name, page_base)
+                ));
             }
-            links.push_str(&format!(
-                "<link rel=\"stylesheet\" href=\"{}\" crossorigin />",
-                with_base(css_name, page_base)
-            ));
         }
     }
     links
@@ -5379,19 +5454,7 @@ fn apply_preload_helper(
             for target in &chunk.dynamic_imports {
                 let target = target.to_string();
                 let rel = relative_chunk_path(&file, &target);
-                let mut deps: Vec<String> = Vec::new();
-                let closure: Vec<String> = std::iter::once(target.clone())
-                    .chain(transitive_imports(&target, imports_map))
-                    .collect();
-                for c in &closure {
-                    if own.contains(c) {
-                        continue;
-                    }
-                    deps.push(c.clone());
-                    if let Some(css) = css_of.get(c.as_str()) {
-                        deps.push(css.to_string());
-                    }
-                }
+                let mut deps = preload_deps(&target, imports_map, &css_of, &own);
                 // Only the chunk itself: `import()` fetches it anyway.
                 if deps.len() <= 1 {
                     deps.clear();
@@ -7476,6 +7539,132 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["a".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_sync_chunks_puts_dependencies_before_dependents() {
+        let map = |pairs: &[(&str, &[&str])]| {
+            pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        v.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        // entry -> base, and entry -> mid which -> deep.
+        let imports = map(&[
+            ("entry.js", &["base.js", "mid.js"]),
+            ("mid.js", &["deep.js"]),
+        ]);
+        assert_eq!(
+            ordered_sync_chunks(&["entry.js".to_string()], &imports),
+            vec![
+                "base.js".to_string(),
+                "deep.js".to_string(),
+                "mid.js".to_string(),
+                "entry.js".to_string(),
+            ]
+        );
+        // A shared dep is visited once, and a cycle terminates.
+        let shared = map(&[
+            ("a.js", &["shared.js", "b.js"]),
+            ("b.js", &["shared.js", "a.js"]),
+        ]);
+        assert_eq!(
+            ordered_sync_chunks(&["a.js".to_string()], &shared),
+            vec![
+                "shared.js".to_string(),
+                "b.js".to_string(),
+                "a.js".to_string(),
+            ]
+        );
+        // A dep shared by two entries is emitted once, under the first.
+        let entries = map(&[
+            ("x.js", &["shared.js"]),
+            ("y.js", &["shared.js", "y-only.js"]),
+        ]);
+        assert_eq!(
+            ordered_sync_chunks(&["x.js".to_string(), "y.js".to_string()], &entries),
+            vec![
+                "shared.js".to_string(),
+                "x.js".to_string(),
+                "y-only.js".to_string(),
+                "y.js".to_string(),
+            ]
+        );
+    }
+
+    // A page's `<link>` order must follow the chunk graph, not Rolldown's
+    // output order: Vite links an imported (shared/vendor) stylesheet before the
+    // entry's own, so a module rule wins the equal-specificity tie.
+    #[test]
+    fn split_css_links_orders_shared_css_before_the_entry_css() {
+        let chunk_css = vec![
+            ("entry.js".to_string(), "entry.css".to_string()),
+            ("base.js".to_string(), "base.css".to_string()),
+        ];
+        let mut imports_map = std::collections::HashMap::new();
+        imports_map.insert("entry.js".to_string(), vec!["base.js".to_string()]);
+        let links = split_css_links(&chunk_css, &["entry.js".to_string()], &imports_map, "/");
+        assert_eq!(
+            links,
+            "<link rel=\"stylesheet\" href=\"/base.css\" crossorigin />\n<link rel=\"stylesheet\" href=\"/entry.css\" crossorigin />"
+        );
+        // A chunk that is not synchronously reachable keeps its CSS unlinked.
+        let dyn_css = vec![
+            ("entry.js".to_string(), "entry.css".to_string()),
+            ("lazy.js".to_string(), "lazy.css".to_string()),
+        ];
+        let links = split_css_links(
+            &dyn_css,
+            &["entry.js".to_string()],
+            &std::collections::HashMap::new(),
+            "/",
+        );
+        assert_eq!(
+            links,
+            "<link rel=\"stylesheet\" href=\"/entry.css\" crossorigin />"
+        );
+    }
+
+    // Vite's addDeps: a lazy chunk's own stylesheet after the CSS of the chunks
+    // it imports, and nothing the importer already has.
+    #[test]
+    fn preload_deps_put_a_lazy_chunks_css_after_its_imports() {
+        let imports: std::collections::HashMap<String, Vec<String>> = [
+            ("lazy.js", vec!["shared.js", "vendor.js"]),
+            ("shared.js", vec!["vendor.js"]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+        .collect();
+        let css_of: std::collections::HashMap<&str, &str> = [
+            ("lazy.js", "lazy.css"),
+            ("shared.js", "shared.css"),
+            ("vendor.js", "vendor.css"),
+        ]
+        .into_iter()
+        .collect();
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(
+            preload_deps("lazy.js", &imports, &css_of, &none),
+            [
+                "lazy.js",
+                "shared.js",
+                "vendor.js",
+                "vendor.css",
+                "shared.css",
+                "lazy.css"
+            ]
+        );
+        let own = std::collections::BTreeSet::from(["vendor.js".to_string()]);
+        assert_eq!(
+            preload_deps("lazy.js", &imports, &css_of, &own),
+            ["lazy.js", "shared.js", "shared.css", "lazy.css"]
         );
     }
 
