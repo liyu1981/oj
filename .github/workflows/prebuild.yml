@@ -1,17 +1,24 @@
 name: prebuild
 
 # Downloadable Linux CLI binaries, so each upstream release on the fork
-# carries amd64 (x86_64) and arm64 (aarch64) builds of `oj`, in both glibc
-# and static musl flavors, without the caller needing a Rust toolchain. Each
-# target builds natively on a matching runner rather than cross-compiling,
-# which keeps rusty_v8's prebuilt-archive selection and the native linked-v8
-# path exactly what `cargo install oj` produces.
+# carries amd64 (x86_64) and arm64 (aarch64) glibc builds of `oj` without
+# the caller needing a Rust toolchain. Each target builds natively on a
+# matching runner rather than cross-compiling, which keeps rusty_v8's
+# prebuilt-archive selection and the native linked-v8 path exactly what
+# `cargo install oj` produces.
 #
 # A tag is the release trigger: tools/prebuild-release.sh pushes vX.Y.Z and
-# this runs the four builds, then attaches the tarballs to a GitHub release
-# of the same name. The script's `prebuild` branch push only moves the ref,
-# so a sync does not start a second build. workflow_dispatch builds the
+# this runs the builds, then attaches the tarballs to a GitHub release of
+# the same name. The script's `prebuild` branch push only moves the ref, so
+# a sync does not start a second build. workflow_dispatch builds the
 # artifacts without touching a release.
+#
+# musl (*-linux-musl) is deliberately not built: upstream oj_deno_runtime
+# calls libc::malloc_trim, which the `libc` crate exposes only for glibc, so
+# the workspace does not compile for musl. When that is cfg-guarded (here or
+# upstream), re-add the musl matrix entries plus the musl-gcc kernel UAPI
+# headers libffi-sys needs (linux-libc-dev and
+# CFLAGS=-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)).
 on:
   push:
     tags: ["v*"]
@@ -25,7 +32,7 @@ permissions:
 
 jobs:
   build:
-    name: linux ${{ matrix.arch }} ${{ matrix.libc }}
+    name: linux ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -34,38 +41,16 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: amd64
-            libc: gnu
             target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-latest
-            arch: amd64
-            libc: musl
-            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             arch: arm64
-            libc: gnu
             target: aarch64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-            libc: musl
-            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: "1.95"
           targets: ${{ matrix.target }}
-      # musl-gcc's specs (musl-tools) search only musl's own include dir and
-      # never /usr/include, where the kernel UAPI headers live. libffi-sys
-      # compiles libffi from source and tramp.c includes <linux/limits.h> and
-      # <linux/types.h> (which pulls <asm/types.h> from the multiarch dir).
-      # -idirafter searches last, so adding /usr/include this way can never
-      # shadow one of musl's own headers with the glibc copy.
-      - name: install musl-tools + kernel headers
-        if: matrix.libc == 'musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools linux-libc-dev
-          echo "CFLAGS=-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
@@ -84,15 +69,15 @@ jobs:
           sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: oj-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          name: oj-linux-${{ matrix.arch }}
           path: |
             oj-*.tar.gz
             oj-*.tar.gz.sha256
           if-no-files-found: error
 
-  # One release for the tag, with all four builds attached. The tag already
-  # exists (the script pushed it); this only fills in the release. Re-runs
-  # clobber the assets instead of failing on an existing release.
+  # One release for the tag, with both builds attached. The tag already exists
+  # (the script pushed it); this only fills in the release. Re-runs clobber the
+  # assets instead of failing on an existing release.
   release:
     name: github release
     needs: build
