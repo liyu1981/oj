@@ -14,8 +14,9 @@
 # (the prebuild workflow and this script) and none of the upstream tree, so
 # the overlay is a straight copy with nothing to merge as upstream moves.
 #
-# Pushing `prebuild` starts the prebuild workflow. Upstream's release.yml is
-# dropped from the generated commit by default so a tag push on the fork
+# The pushed tag starts the prebuild workflow, which builds the four Linux
+# targets and files them as a GitHub release of the same name. Upstream's
+# release.yml is dropped from the generated commit by default so the tag
 # cannot attempt a crates.io publish; set KEEP_RELEASE_WORKFLOW=1 to keep it.
 #
 # Overridable env:
@@ -103,4 +104,4 @@ git push --force-with-lease "$ORIGIN" \
   "refs/heads/$TARGET_BRANCH:refs/heads/$TARGET_BRANCH"
 git push --force "$ORIGIN" "refs/tags/$tag:refs/tags/$tag"
 echo "prebuild-release: pushed $TARGET_BRANCH and $tag to $ORIGIN"
-echo "prebuild-release: the $TARGET_BRANCH push starts the prebuild workflow"
+echo "prebuild-release: the $tag tag starts the prebuild workflow and its release"
