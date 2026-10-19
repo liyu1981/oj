@@ -54,12 +54,18 @@ jobs:
         with:
           toolchain: "1.95"
           targets: ${{ matrix.target }}
-      # The musl targets link self-contained (their own crt/libc from the
-      # rust-std component), so this is only so a crate's build script that
-      # probes for musl-gcc finds one instead of reaching for the glibc cc.
-      - name: install musl-tools
+      # musl-gcc's specs (musl-tools) search only musl's own include dir and
+      # never /usr/include, where the kernel UAPI headers live. libffi-sys
+      # compiles libffi from source and tramp.c includes <linux/limits.h> and
+      # <linux/types.h> (which pulls <asm/types.h> from the multiarch dir).
+      # -idirafter searches last, so adding /usr/include this way can never
+      # shadow one of musl's own headers with the glibc copy.
+      - name: install musl-tools + kernel headers
         if: matrix.libc == 'musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools linux-libc-dev
+          echo "CFLAGS=-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
