@@ -1,0 +1,79 @@
+name: prebuild
+
+# Downloadable Linux CLI binaries, so the `prebuild` branch carries amd64
+# (x86_64) and arm64 (aarch64) builds of `oj`, in both glibc and static
+# musl flavors, without the caller needing a Rust toolchain. Each target
+# builds natively on a matching runner rather than cross-compiling, which
+# keeps rusty_v8's prebuilt-archive selection and the native linked-v8 path
+# exactly what `cargo install oj` produces.
+on:
+  push:
+    branches: [prebuild]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: linux ${{ matrix.arch }} ${{ matrix.libc }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            libc: gnu
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-latest
+            arch: amd64
+            libc: musl
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            libc: gnu
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            libc: musl
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+      # The musl targets link self-contained (their own crt/libc from the
+      # rust-std component), so this is only so a crate's build script that
+      # probes for musl-gcc finds one instead of reaching for the glibc cc.
+      - name: install musl-tools
+        if: matrix.libc == 'musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      # Release, not debug: this is the artifact people download, and it is
+      # the same profile `cargo install oj --locked` builds.
+      - name: cargo build
+        run: cargo build --release --locked -p oj --target ${{ matrix.target }}
+      - name: smoke
+        run: ./target/${{ matrix.target }}/release/oj --version
+      - name: package
+        run: |
+          out="oj-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$out"
+          cp "target/${{ matrix.target }}/release/oj" "$out/oj"
+          tar -C "$out" -czf "$out.tar.gz" oj
+          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oj-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          path: |
+            oj-*.tar.gz
+            oj-*.tar.gz.sha256
+          if-no-files-found: error
