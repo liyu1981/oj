@@ -6146,6 +6146,7 @@ dependencies = [
  "deno_core",
  "flate2",
  "futures-util",
+ "glob",
  "libc",
  "notify",
  "oj_cache",
