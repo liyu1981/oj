@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A file under `server.watch.ignored` (or the cache dir) written more often than every 10ms no longer holds the watcher's batch open, so an edit made meanwhile reaches HMR. Excluded paths are now dropped as each event arrives.
 - In TanStack Start, a server function whose handler contains a comment or string with an unbalanced parenthesis no longer breaks the client bundle with a parse error. The client and build rewrites now skip comments, strings, templates and regex literals when finding the handler's end, as the SSR rewrite already did.
 - A string returned from the embedded engine that contains a lone surrogate arrives with U+FFFD instead of as `null`.
+- A restart, or a boot after the deps cache was cleared, no longer serves its pre-bundled deps under `?v=` URLs an earlier session handed out. Those URLs are cached `immutable`, so the browser could keep bytes from a bundle that no longer existed. As in Vite, each session salts the dep versions it mints, and a warm boot keeps the persisted ones. A versioned dep URL whose file is gone answers Vite's outdated 504 instead of 404.
+- Stopping or restarting `oj dev` kills a running engine job (the dep scan, the pre-bundle, config extraction) with the server's other children. The job used to outlive the server until it noticed its parent was gone, writing V8 code cache into `.oj-cache` meanwhile.
 
 ## [0.2.39] - 2026-10-19
 
