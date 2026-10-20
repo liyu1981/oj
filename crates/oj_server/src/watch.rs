@@ -749,9 +749,11 @@ fn handle_batch(
     // Vite's watcher, per change: plugin watchChange, then the module graph
     // invalidation, then HMR, which `server.hmr: false` skips and the editor
     // gate holds until its flush. The first two run either way. A Tailwind
-    // sheet is dropped at once, as it carries no plugin state.
+    // sheet is dropped at once, as it carries no plugin state; so are the
+    // resolvers' cached misses, which Vite's resolver never keeps.
     if !paths.is_empty() {
         state.tailwind_sheets.invalidate();
+        crate::hmr::drop_resolver_misses(state, paths, created);
     }
     let dispatch = state.hmr_enabled
         && !state
@@ -916,6 +918,13 @@ pub(crate) fn spawn_watcher(
             let paths: Vec<PathBuf> = paths.into_iter().collect();
             created.retain(|p| !seen_paths.contains(p));
             seen_paths.extend(paths.iter().cloned());
+            // chokidar reports `add` again for a path after its `unlink`, so a
+            // deleted path is unseen: recreated, it is a create, not an edit.
+            for p in &paths {
+                if !p.exists() {
+                    seen_paths.remove(p);
+                }
+            }
             handle_batch(&state, &paths, &created);
         }
     });
