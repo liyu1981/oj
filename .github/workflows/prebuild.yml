@@ -104,11 +104,21 @@ jobs:
               CHANGELOG.md > notes.md
             if [ -s notes.md ]; then
               gh release create "$GITHUB_REF_NAME" \
-                --title "oj $GITHUB_REF_NAME" --notes-file notes.md
+                --title "oj $GITHUB_REF_NAME" --notes-file notes.md --latest=false
             else
               gh release create "$GITHUB_REF_NAME" \
-                --title "oj $GITHUB_REF_NAME" --generate-notes
+                --title "oj $GITHUB_REF_NAME" --generate-notes --latest=false
             fi
           fi
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          # The daily sync can release several tags in one run and their
+          # workflows race. GitHub would otherwise mark whichever was
+          # *published* last as "Latest" (v0.2.38 beat v0.2.39 that way), so
+          # never let create claim it and let only the highest semver release
+          # take it. Re-running this job also repairs a wrong label.
+          latest="$(gh release list --limit 200 --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName' | sed '/^$/d' | sort -V | tail -1)"
+          if [ "$latest" = "$GITHUB_REF_NAME" ]; then
+            gh release edit "$GITHUB_REF_NAME" --latest
+          fi
           ls -l dist
