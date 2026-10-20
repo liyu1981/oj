@@ -5,7 +5,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { transformGlob } from "../../crates/oj_server/src/assets/start/glob-transform.mjs";
+import {
+  transformGlob,
+  transformImportMetaUrl,
+  stripLiterals,
+} from "../../crates/oj_server/src/assets/start/glob-transform.mjs";
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "oj-glob-"));
@@ -355,6 +359,235 @@ test("caseSensitive: false matches regardless of case; the importer itself is sk
     writeFileSync(join(dir, "pages", "index.ts"), "");
     const self = transformGlob('const m = import.meta.glob("./**/*.ts");', join(dir, "pages", "index.ts"), dir);
     assert.doesNotMatch(self, /"\.\/index\.ts"/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Vite's vite:worker-import-meta-url and vite:asset-import-meta-url, on a
+// bundled client module: the URL points at the file's worker/asset import
+// instead of staying relative to the chunk.
+function urlFixture() {
+  const dir = mkdtempSync(join(tmpdir(), "oj-meta-url-"));
+  mkdirSync(join(dir, "img"), { recursive: true });
+  writeFileSync(join(dir, "draw-worker.ts"), "self.onmessage = () => {};");
+  writeFileSync(join(dir, "img", "a.png"), "");
+  writeFileSync(join(dir, "img", "b.png"), "");
+  return dir;
+}
+const fsResolve = async (spec, importer) => {
+  const { existsSync } = await import("node:fs");
+  const { resolve: res, dirname } = await import("node:path");
+  // A bundler resolves only a relative spec to a file here; a bare one would
+  // be a package.
+  if (spec[0] !== ".") return null;
+  const abs = res(dirname(importer), spec);
+  return existsSync(abs) ? abs : null;
+};
+// Runs `fn` with console.warn captured.
+async function warnings(fn) {
+  const seen = [];
+  const warn = console.warn;
+  console.warn = (m) => seen.push(String(m));
+  try {
+    return { out: await fn(), seen };
+  } finally {
+    console.warn = warn;
+  }
+}
+
+test("new Worker(new URL(...)) imports the worker's ?worker&url", async () => {
+  const dir = urlFixture();
+  try {
+    const id = join(dir, "game.ts");
+    const code = 'const w = new Worker(new URL("./draw-worker.ts", import.meta.url), { type: "module" });';
+    const out = await transformImportMetaUrl(code, id, fsResolve);
+    const spec = JSON.stringify(join(dir, "draw-worker.ts") + "?worker&url");
+    assert.ok(out.startsWith(`import __oj_worker_url0 from ${spec};`), out);
+    assert.match(
+      out,
+      /new Worker\(new URL\(\/\* @vite-ignore \*\/ __oj_worker_url0, '' \+ import\.meta\.url\), \{ type: "module" \}\)/,
+    );
+    assert.doesNotMatch(out, /"\.\/draw-worker\.ts"/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a SharedWorker's URL imports ?sharedworker&url, a query kept", async () => {
+  const dir = urlFixture();
+  try {
+    const code = "new SharedWorker(new URL('./draw-worker.ts?x=1', import.meta.url))";
+    const out = await transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve);
+    assert.ok(out.includes(JSON.stringify(join(dir, "draw-worker.ts") + "?sharedworker&url&x=1")), out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("new URL(asset, import.meta.url) imports the asset's ?url", async () => {
+  const dir = urlFixture();
+  try {
+    const code = 'export const a = new URL("./img/a.png", import.meta.url).href;';
+    const out = await transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve);
+    assert.ok(
+      out.startsWith(`import __oj_asset_url0 from ${JSON.stringify(join(dir, "img", "a.png") + "?url")};`),
+      out,
+    );
+    assert.match(out, /new URL\(__oj_asset_url0, '' \+ import\.meta\.url\)\.href/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a template asset URL becomes Vite's eager ?url glob lookup", async () => {
+  const dir = urlFixture();
+  try {
+    const id = join(dir, "game.ts");
+    const code = "const n = 'a';\nexport const u = new URL(`./img/${n}.png`, import.meta.url);";
+    const out = await transformImportMetaUrl(code, id, fsResolve);
+    assert.ok(
+      out.includes(
+        'new URL((import.meta.glob("./img/*.png", {"eager":true,"import":"default","query":"?url"}))[`./img/${n}.png`], import.meta.url)',
+      ),
+      out,
+    );
+    const expanded = transformGlob(out, id);
+    assert.match(expanded, /import __oj_glob0_0 from "\.\/img\/a\.png\?url";/);
+    assert.match(expanded, /"\.\/img\/b\.png": __oj_glob0_1/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("comments, strings, data: URLs, @vite-ignore and missing files stay as written", async () => {
+  const dir = urlFixture();
+  try {
+    const code = [
+      '// new Worker(new URL("./draw-worker.ts", import.meta.url))',
+      "const s = \"new URL('./img/a.png', import.meta.url)\";",
+      'const d = new URL("data:text/plain,hi", import.meta.url);',
+      'const i = new URL(/* @vite-ignore */ "./img/a.png", import.meta.url);',
+      'const m = new URL("./img/missing.png", import.meta.url);',
+      'const w = new Worker(new URL("./missing-worker.ts", import.meta.url));',
+      "",
+    ].join("\n");
+    const { out, seen } = await warnings(() => transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve));
+    assert.equal(out, code);
+    // Vite's warning, once for each missing file.
+    assert.equal(seen.length, 2, seen.join("\n"));
+    assert.match(seen[0], /missing-worker\.ts.*doesn't exist at build time/);
+    assert.match(seen[1], /missing\.png.*@vite-ignore/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a dynamic template worker URL is an error, as in Vite", async () => {
+  await assert.rejects(
+    transformImportMetaUrl("new Worker(new URL(`./${n}.ts`, import.meta.url))", "/app/x.ts", fsResolve),
+    /not supported in dynamic template string/,
+  );
+});
+
+test("the rewrite keeps every line where it was", async () => {
+  const dir = urlFixture();
+  try {
+    const code =
+      'a();\nconst w = new Worker(\n  new URL(\n    "./draw-worker.ts",\n    import.meta.url,\n  ),\n);\nb();';
+    const out = await transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve);
+    assert.equal(out.split("\n").length, code.split("\n").length);
+    assert.equal(out.split("\n").at(-1), "b();");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a URL without ./ prefers the importer's directory, as Vite's preferRelative", async () => {
+  const dir = urlFixture();
+  try {
+    const code = 'new Worker(new URL("draw-worker.ts", import.meta.url)); new URL("img/a.png", import.meta.url);';
+    const out = await transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve);
+    assert.ok(out.includes(JSON.stringify(join(dir, "draw-worker.ts") + "?worker&url")), out);
+    assert.ok(out.includes(JSON.stringify(join(dir, "img", "a.png") + "?url")), out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a / URL is a root file when one exists, else a public URL left as written", async () => {
+  const dir = urlFixture();
+  try {
+    const code =
+      'new URL("/img/a.png", import.meta.url); new URL("/favicon.ico", import.meta.url); new URL("https://x.test/a.png", import.meta.url);';
+    const out = await transformImportMetaUrl(code, join(dir, "src", "game.ts"), fsResolve, dir);
+    assert.ok(
+      out.startsWith(`import __oj_asset_url0 from ${JSON.stringify(join(dir, "img", "a.png") + "?url")};`),
+      out,
+    );
+    assert.ok(out.includes('new URL("/favicon.ico", import.meta.url)'), out);
+    assert.ok(out.includes('new URL("https://x.test/a.png", import.meta.url)'), out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an asset URL's query joins its import (Vite's injectQuery), a hash stays on the URL", async () => {
+  const dir = urlFixture();
+  try {
+    const code = 'new URL("./img/a.png?inline", import.meta.url); new URL("./img/b.png#top", import.meta.url);';
+    const out = await transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve);
+    assert.ok(out.includes(JSON.stringify(join(dir, "img", "a.png") + "?url&inline")), out);
+    assert.ok(out.includes(JSON.stringify(join(dir, "img", "b.png") + "?url")), out);
+    assert.match(out, /new URL\(__oj_asset_url1 \+ "#top", '' \+ import\.meta\.url\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("literals strip like strip-literal: template code stays, regex bodies blank", async () => {
+  assert.equal(stripLiterals("a(`x${b('c')}y`) // d"), "a(` ${b(' ')} `)     ");
+  assert.equal(stripLiterals("x = /'[/]\\//g; y = a / b / c;"), "x = /      /g; y = a / b / c;");
+  const dir = urlFixture();
+  try {
+    // A call inside a template's ${} is code, as Vite matches it; a quote in
+    // a regex literal opens no string.
+    const code = [
+      "const q = /'/;",
+      'const html = `<p>${new URL("./img/a.png", import.meta.url)}</p>`;',
+      'const w = new Worker(new URL("./draw-worker.ts", import.meta.url));',
+      "",
+    ].join("\n");
+    const out = await transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve);
+    assert.ok(out.includes("${new URL(__oj_asset_url1, '' + import.meta.url)}"), out);
+    assert.ok(out.includes("new Worker(new URL(/* @vite-ignore */ __oj_worker_url0"), out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("public and scheme URLs left as written raise no warning", async () => {
+  const dir = urlFixture();
+  try {
+    const code = [
+      'const p = new URL("/only-in-public.png", import.meta.url);',
+      'const h = new URL("https://example.com/a.png", import.meta.url);',
+    ].join("\n");
+    const { out, seen } = await warnings(() => transformImportMetaUrl(code, join(dir, "game.ts"), fsResolve, dir));
+    assert.equal(out, code);
+    assert.deepEqual(seen, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a worker starting itself gets self.location.href, as in Vite", async () => {
+  const dir = urlFixture();
+  try {
+    const id = join(dir, "draw-worker.ts");
+    const code = 'new Worker(new URL("./draw-worker.ts", import.meta.url), { type: "module" });';
+    const out = await transformImportMetaUrl(code, id, fsResolve, dir, id);
+    assert.equal(out, 'new Worker(self.location.href, { type: "module" });');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
