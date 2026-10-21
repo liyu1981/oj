@@ -86,16 +86,31 @@ struct StartState {
     /// (rollup watch semantics; Vite's module graph plays this role). Empty
     /// means unknown, which always rebundles.
     client_closure: std::sync::RwLock<std::collections::HashSet<PathBuf>>,
-    /// The scan base of every `import.meta.glob` the bundle expanded
-    /// (glob-scopes.json). A file CREATED under one grows a glob's expansion,
-    /// so it rebundles; a create anywhere else cannot change a bundle whose
-    /// inputs all resolved, and is ignored -- Vite's add handling, which only
-    /// re-expands glob importers (resolution shifts land when an importer
-    /// changes or the bundle failed, there as here).
-    client_glob_scopes: std::sync::RwLock<Vec<PathBuf>>,
+    /// Every `import.meta.glob` the bundle expanded (glob-scopes.json). A
+    /// file CREATED that one matches grows its expansion, so it rebundles; a
+    /// create anywhere else cannot change a bundle whose inputs all resolved,
+    /// and is ignored -- Vite's add handling, which only re-expands the
+    /// importers of the globs an added file matches (resolution shifts land
+    /// when an importer changes or the bundle failed, there as here).
+    client_glob_scopes: std::sync::RwLock<Vec<oj_compiler::glob::GlobMatcher>>,
     /// False after a failed rebundle: the closure may be a torso (the build
     /// stopped early), so every next batch rebundles until one succeeds.
     bundle_ok: std::sync::atomic::AtomicBool,
+    /// A runner-rendered document handed a page the Start client bundle. The
+    /// worker environments' documents never do: TanStack's own manifest
+    /// answers there, and its script is the unbundled dev client entry, so
+    /// those pages run the client module graph, as under Vite.
+    bundle_loaded: std::sync::atomic::AtomicBool,
+    /// Edits changed the bundle's inputs while no page loaded it, and no
+    /// rebundle ran for them; the next runner document brings it current.
+    bundle_deferred: std::sync::atomic::AtomicBool,
+    /// True while the deferred bundle is building: a runner document waits
+    /// for it rather than handing out the empty one.
+    deferred_build: tokio::sync::watch::Sender<bool>,
+    /// The coalescing rebundle worker's queue (at most one pending run) and
+    /// its wake.
+    rebundles: Arc<std::sync::Mutex<Option<PendingRebundle>>>,
+    rebundle_wake: Arc<tokio::sync::Notify>,
     /// The dev server's SSR bridge, here for its module-graph lookup: files
     /// the generic pipeline serves (a dev worker script fetched by URL) are
     /// in no other graph the reload decision consults.
@@ -150,6 +165,13 @@ impl StartState {
     /// eagerly on every edit. Live: a slow plugin host flips this after boot.
     fn lazy_runner(&self) -> bool {
         self.plugin_serve.runner_environments()
+    }
+
+    /// Whether any page can be running the Start client bundle: with the
+    /// worker environments serving the documents, only one the fallback
+    /// runner rendered.
+    fn pages_run_bundle(&self) -> bool {
+        !self.lazy_runner() || self.bundle_loaded.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -300,6 +322,12 @@ pub async fn start_dev(
     resolver.await??;
     oj_server::boot_phase("resolver ready");
     let bundler = Arc::new(ClientBundler::new(&root, &cache));
+    // A Cloudflare app's documents come from the worker environments, which
+    // render them from TanStack's own manifest: their pages load the dev
+    // client entry, never the Start bundle. It is built when a runner
+    // document first hands it out (`ensure_bundle_current`), so a session
+    // whose worker serves every document never starts the bundler at all.
+    let defer_bundle = cf_hint;
     let bundle = {
         let (bundler, cache, env, mode) = (
             Arc::clone(&bundler),
@@ -307,9 +335,16 @@ pub async fn start_dev(
             Arc::clone(&script_vars),
             mode.clone(),
         );
-        tokio::task::spawn_blocking(move || {
-            bundle_client_entry_cached(&bundler, &cache, &env, &mode)
-        })
+        async move {
+            if defer_bundle {
+                oj_server::boot_phase("client bundle deferred (worker-rendered documents)");
+                return Ok(Ok(None));
+            }
+            tokio::task::spawn_blocking(move || {
+                bundle_client_entry_cached(&bundler, &cache, &env, &mode).map(Some)
+            })
+            .await
+        }
     };
     let (reload_tx, _) = broadcast::channel::<()>(16);
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
@@ -318,7 +353,8 @@ pub async fn start_dev(
     // the next edit rebundles. Anything else (the bundler failing to load)
     // still aborts the boot.
     let (pinned, boot_error) = match bundle_res? {
-        Ok(pinned) => (pinned, None),
+        Ok(Some(pinned)) => (pinned, None),
+        Ok(None) => (oj_cache::start_bundle::PinnedBundle::empty(), None),
         Err(e) => match client_error_frame(&cache) {
             Some(frame) => {
                 eprintln!("  oj start: client bundle failed, serving the error overlay: {e:#}");
@@ -393,6 +429,9 @@ pub async fn start_dev(
     // also sidesteps the bound-interface question a TCP self-request had
     // (::1 vs 127.0.0.1 vs a specific host): there is no socket to dial.
     let (app_tx, app_rx) = tokio::sync::oneshot::channel::<axum::Router>();
+    // Sent once the prewarm knows oj's runner renders the documents: their
+    // pages load the Start bundle, so a deferred one starts building then.
+    let (runner_documents_tx, runner_documents_rx) = tokio::sync::oneshot::channel::<()>();
     {
         let engine = Arc::clone(&engine);
         let reload_tx = reload_tx.clone();
@@ -458,6 +497,7 @@ pub async fn start_dev(
                     }
                 }
             }
+            let _ = runner_documents_tx.send(());
             let _ = engine
                 .handle(engine_request(
                     "GET".into(),
@@ -528,6 +568,11 @@ pub async fn start_dev(
         client_glob_scopes: std::sync::RwLock::new(load_client_glob_scopes(&cache)),
         // A failed boot bundle rebundles on every next batch until one succeeds.
         bundle_ok: std::sync::atomic::AtomicBool::new(boot_error.is_none()),
+        bundle_loaded: std::sync::atomic::AtomicBool::new(false),
+        bundle_deferred: std::sync::atomic::AtomicBool::new(defer_bundle),
+        deferred_build: tokio::sync::watch::channel(false).0,
+        rebundles: Arc::new(std::sync::Mutex::new(None)),
+        rebundle_wake: Arc::new(tokio::sync::Notify::new()),
         ssr: built.ssr.clone(),
         refresh_wake: tokio::sync::Notify::new(),
         urgent: std::sync::atomic::AtomicBool::new(false),
@@ -574,6 +619,18 @@ pub async fn start_dev(
         });
     }
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state), watch_rx);
+    // Once the serve info says oj's runner renders the documents (no worker
+    // environment does, or the host never announced), their pages load the
+    // Start bundle: build a deferred one then, as Vite's bundled dev builds
+    // at startup, instead of making the first document wait for it.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if runner_documents_rx.await.is_ok() {
+                start_deferred_bundle(&state);
+            }
+        });
+    }
     {
         let (root, mode) = (root.clone(), mode.clone());
         tokio::task::spawn_blocking(move || {
@@ -605,6 +662,51 @@ pub async fn start_dev(
     println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
     oj_server::tls::serve_router(listener, app, built.https.as_ref()).await?;
     Ok(())
+}
+
+/// Queues the bundle left unbuilt (a Cloudflare boot) or stale (edits while
+/// no page loaded it, see `StartState::pages_run_bundle`), once: whoever
+/// needs it first starts it, and `deferred_build` stays raised until it ran.
+fn start_deferred_bundle(state: &Arc<StartState>) {
+    if !state
+        .bundle_deferred
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.deferred_build.send_replace(true);
+    {
+        let mut slot = state
+            .rebundles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run = slot.get_or_insert_with(PendingRebundle::default);
+        run.force = true;
+        run.done.push(tx);
+    }
+    state.rebundle_wake.notify_one();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let _ = rx.await;
+        state.deferred_build.send_replace(false);
+    });
+}
+
+/// A runner document loads the Start client bundle: it waits for a deferred
+/// one, its own or one boot already started (bounded, like
+/// `client_output_fresh`), and edits from then on rebundle it as they come.
+async fn ensure_bundle_current(state: &Arc<StartState>) {
+    state
+        .bundle_loaded
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    start_deferred_bundle(state);
+    let mut building = state.deferred_build.subscribe();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        building.wait_for(|b| !*b),
+    )
+    .await;
 }
 
 /// On the Cloudflare path the runner is only a fallback: edits mark it dirty
@@ -782,6 +884,11 @@ struct PendingRebundle {
     created: std::collections::HashSet<PathBuf>,
     /// The newest merged batch number: its done-frame clears the editor pill.
     batch: u64,
+    /// A runner document is about to hand pages the bundle that edits left
+    /// stale (`bundle_deferred`): rebundle whatever the paths say.
+    force: bool,
+    /// Signalled once this run completes.
+    done: Vec<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Spawn one worker-environment invalidate for a batch's relevant paths, off
@@ -817,28 +924,52 @@ fn load_client_closure(cache: &Path) -> std::collections::HashSet<PathBuf> {
         .unwrap_or_default()
 }
 
-/// The scan base of every glob the last bundle expanded, written by
-/// bundle-client.mjs beside the closure. Missing or unreadable is an empty
-/// list: the closure check still rebundles for every known input, and the
-/// bundle-ok flag for every failed one.
-fn load_client_glob_scopes(cache: &Path) -> Vec<PathBuf> {
-    std::fs::read_to_string(cache.join("glob-scopes.json"))
+/// Every glob call the last bundle expanded, as bundle-client.mjs writes them
+/// beside the closure (Vite's resolved patterns and options, see
+/// `oj_compiler::glob::GlobCall`), with Vite's matcher for each. Missing or
+/// unreadable is an empty list: the closure check still rebundles for every
+/// known input, and the bundle-ok flag for every failed one.
+fn load_client_glob_scopes(cache: &Path) -> Vec<oj_compiler::glob::GlobMatcher> {
+    let Some(entries) = std::fs::read_to_string(cache.join("glob-scopes.json"))
         .ok()
-        .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            // A cache an older oj wrote holds scan bases: anything under one.
+            let call = match e.as_str() {
+                Some(base) => oj_compiler::glob::GlobCall {
+                    patterns: vec![format!("{base}/**")],
+                    exhaustive: true,
+                    case_sensitive: true,
+                },
+                None => oj_compiler::glob::GlobCall::from_json(e)?,
+            };
+            Some(call.matcher())
+        })
+        .collect()
 }
 
-/// A created file under a bundled glob's scan base grows that glob's
-/// expansion (the one way a NEW file changes a bundle whose inputs all
-/// resolved). The watcher spelling or its real path, like the closure check.
-fn created_in_glob_scope(scopes: &[PathBuf], created: &std::collections::HashSet<PathBuf>) -> bool {
+/// A created file a bundled glob matches grows that glob's expansion (the
+/// one way a NEW file changes a bundle whose inputs all resolved). The
+/// watcher spelling or its real path, like the closure check.
+fn created_in_glob_scope(
+    scopes: &[oj_compiler::glob::GlobMatcher],
+    created: &std::collections::HashSet<PathBuf>,
+) -> bool {
     if scopes.is_empty() || created.is_empty() {
         return false;
     }
-    created.iter().any(|p| {
-        scopes.iter().any(|d| p.starts_with(d))
-            || std::fs::canonicalize(p).is_ok_and(|real| scopes.iter().any(|d| real.starts_with(d)))
-    })
+    let matched = |p: &Path| {
+        let file = p.to_string_lossy().replace('\\', "/");
+        scopes.iter().any(|g| g.is_match(&file))
+    };
+    created
+        .iter()
+        .any(|p| matched(p) || std::fs::canonicalize(p).is_ok_and(|real| matched(&real)))
 }
 
 /// Whether a batch can change the client bundle: a path in the closure (the
@@ -974,9 +1105,8 @@ fn spawn_start_watcher(
     rx: std::sync::mpsc::Receiver<notify::Event>,
 ) {
     let rt = tokio::runtime::Handle::current();
-    let pending: Arc<std::sync::Mutex<Option<PendingRebundle>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let wake = Arc::new(tokio::sync::Notify::new());
+    let pending = Arc::clone(&state.rebundles);
+    let wake = Arc::clone(&state.rebundle_wake);
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The start entry's presence is a config-time input: upstream resolves
     // `#tanstack-start-entry` once in its plugin's `config` hook, and oj
@@ -1155,8 +1285,13 @@ async fn rebundle_worker(
         // acts on files its module graphs know). Regen checks still run below
         // either way: a server fn can live in a file the client never
         // imports, since gen-resolver scans all of src.
-        let needs_bundle = client_bundle_affected(&state, &paths, &run.created);
-        let inputs = client_inputs(&state, &paths, &run.created);
+        // A file that came and went inside the batch (GNU sed's temp, an
+        // editor's safe-write) was never anything a glob could expand to.
+        let created: std::collections::HashSet<PathBuf> =
+            run.created.into_iter().filter(|p| p.exists()).collect();
+        let needs_bundle = run.force || client_bundle_affected(&state, &paths, &created);
+        let inputs = client_inputs(&state, &paths, &created);
+        let pages_run_bundle = state.pages_run_bundle();
         let no_invalidates_sent = run.invalidates.is_empty();
         let client = {
             let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());
@@ -1165,6 +1300,7 @@ async fn rebundle_worker(
             let routes_prev = prev_routes.clone();
             let changed: Vec<PathBuf> = paths.clone();
             let generation = state.bundler.hot.generation();
+            let deferral = Arc::clone(&state);
             // Every batch, bundled or not: a style edit the gate passes over
             // must still recompile at the next bundle.
             bundler.note_changes(&changed);
@@ -1186,7 +1322,19 @@ async fn rebundle_worker(
                 }
                 // A route-set change rewrites the generated tree, a bundled
                 // input, even when the triggering paths missed the closure.
-                let bundling = needs_bundle || routes_changed;
+                // Nothing to bring current while no page runs the bundle; a
+                // runner document that loaded it since (it marks the bundle
+                // loaded before it looks for a deferral) still gets it.
+                let wants = needs_bundle || routes_changed;
+                let bundling = wants
+                    && (pages_run_bundle || {
+                        deferral
+                            .bundle_deferred
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        deferral
+                            .bundle_loaded
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    });
                 // Name what trips an actual rebundle: a feedback loop (a build
                 // output echoing into the watcher) is invisible without the
                 // paths, and only the first few are needed to see it. A batch
@@ -1268,6 +1416,9 @@ async fn rebundle_worker(
                 match outcome {
                     ClientRun::Fresh(pinned) => {
                         install_bundle(&state, &cache, pinned);
+                        state
+                            .bundle_deferred
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                         state.bundler.hot.served_output_of(generation);
                         fresh = true;
                     }
@@ -1338,25 +1489,19 @@ async fn rebundle_worker(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
                 .is_some();
-        // Reload the browser only when something it can observe changed: the
-        // bundle, a regen output, a worker-served module, an engine-served
-        // one, or a module the generic pipeline served (a dev worker script).
-        // A change outside every graph (a README, a config of some other
-        // tool) reloads nothing, as in Vite.
-        // A failed bundle reloads nothing: the page keeps what it runs under
-        // the overlay (Vite's bundled dev), and the fixed bundle reloads it.
-        // A bundle whose changes all went out as hot updates reloads only
-        // for what the pages cannot take in place (a server-fn or route-set
-        // change). The server render of the same modules is fresh for the
-        // next document, as Vite leaves SSR to the next request once client
-        // HMR applied the edit.
         let server_signals =
             worker_hit || engine_hit || paths.iter().any(|p| state.ssr.graph_knows_file(p));
-        let reload = forced
-            || !bundle_failed
-                && (server_fn_changed
-                    || !regen_changed.is_empty()
-                    || !hot && (bundled || server_signals));
+        let unbundled = !pages_run_bundle && !bundled;
+        let reload = reloads_browser(RunSignals {
+            unbundled,
+            forced,
+            bundle_failed,
+            server_fn_changed,
+            regen_changed: !regen_changed.is_empty(),
+            hot,
+            bundled,
+            server_signals,
+        });
         // Tailwind generates rules from the sources it scans: an update
         // applied in place re-links the sheets instead of reloading. A sheet
         // the update imported for the first time is linked in the pages.
@@ -1387,8 +1532,13 @@ async fn rebundle_worker(
             Some(0),
             true,
         ));
+        for done in run.done {
+            let _ = done.send(());
+        }
         if hot && !reload {
             println!("  oj start: hot updated");
+        } else if unbundled && !reload {
+            println!("  oj start: client updates left to the page's module graph, no rebundle");
         } else if !reload {
             println!("  oj start: change outside every served graph, no rebundle, no reload");
         } else if held {
@@ -1403,6 +1553,49 @@ async fn rebundle_worker(
             );
         }
     }
+}
+
+/// What a rebundle run saw, for the browser reload decision.
+#[derive(Clone, Copy, Default)]
+struct RunSignals {
+    /// No page runs the Start bundle: they run the client module graph.
+    unbundled: bool,
+    /// A page asked for a reload, and the run has fresh output for it.
+    forced: bool,
+    bundle_failed: bool,
+    server_fn_changed: bool,
+    regen_changed: bool,
+    /// Every change went out to the pages as a hot update.
+    hot: bool,
+    bundled: bool,
+    /// A worker environment, the engine or the generic pipeline served a
+    /// changed module.
+    server_signals: bool,
+}
+
+/// Reload the browser only when something it can observe changed: the
+/// bundle, a regen output, a worker-served module, an engine-served one, or a
+/// module the generic pipeline served (a dev worker script). A change outside
+/// every graph (a README, a config of some other tool) reloads nothing, as in
+/// Vite.
+/// A failed bundle reloads nothing: the page keeps what it runs under the
+/// overlay (Vite's bundled dev), and the fixed bundle reloads it. A bundle
+/// whose changes all went out as hot updates reloads only for what the pages
+/// cannot take in place (a server-fn or route-set change). The server render
+/// of the same modules is fresh for the next document, as Vite leaves SSR to
+/// the next request once client HMR applied the edit.
+/// With no page on the bundle (worker-rendered documents), the pages run the
+/// client module graph, whose own HMR takes each edit in place or reloads, as
+/// in Vite; a worker environment's update never reaches the page there
+/// either. Only the regen outputs, which the watcher never forwards to that
+/// HMR, still reload.
+fn reloads_browser(s: RunSignals) -> bool {
+    if s.unbundled {
+        return s.forced || s.regen_changed;
+    }
+    s.forced
+        || !s.bundle_failed
+            && (s.server_fn_changed || s.regen_changed || !s.hot && (s.bundled || s.server_signals))
 }
 
 /// What a rebundle did with the client.
@@ -2815,6 +3008,7 @@ async fn forward_document(
             return inject_reload_client(resp);
         }
     }
+    ensure_bundle_current(state).await;
     ensure_runner_fresh(state).await;
     forward(
         &state.engine,
@@ -4088,13 +4282,13 @@ mod tests {
         assert_eq!(set.len(), 2);
     }
 
-    // A created file rebundles only under a bundled glob's scan base: that is
-    // the one way a NEW file changes a bundle whose inputs all resolved (Vite
-    // re-expands glob importers on add and otherwise ignores new files). The
-    // miniflare trace-store journals that fed a rebundle-restart-rebundle loop
-    // are exactly the creates this must ignore.
+    // Vite's import-glob hotUpdate: an added file re-expands the importer of
+    // each glob whose patterns match it (picomatch with `dot: !!exhaustive`,
+    // node_modules ignored unless exhaustive) and changes nothing else. That
+    // is the one way a NEW file changes a bundle whose inputs all resolved.
+    // The calls are glob-transform.mjs output, verbatim.
     #[test]
-    fn created_files_rebundle_only_inside_glob_scopes() {
+    fn created_files_rebundle_only_when_a_glob_matches_them() {
         let dir = tmp("glob-scopes-load");
         assert!(
             load_client_glob_scopes(&dir).is_empty(),
@@ -4107,34 +4301,50 @@ mod tests {
         );
         std::fs::write(
             dir.join("glob-scopes.json"),
-            r#"["/app/src/content","/app/src/icons"]"#,
+            r#"[{"patterns":["/app/src/icons/**/*.{svg,png}","!/app/src/icons/skip/**"],"exhaustive":false,"caseSensitive":false},{"patterns":["/app/src/modules/*/messages/*.json"],"exhaustive":false,"caseSensitive":true},{"patterns":["/app/src/routes/\\[id\\]/*.ts"],"exhaustive":false,"caseSensitive":true}]"#,
         )
         .unwrap();
         let scopes = load_client_glob_scopes(&dir);
-        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes.len(), 3);
 
         let created = |p: &str| std::collections::HashSet::from([PathBuf::from(p)]);
-        assert!(created_in_glob_scope(
-            &scopes,
-            &created("/app/src/content/new.json")
-        ));
-        assert!(created_in_glob_scope(
-            &scopes,
-            &created("/app/src/icons/deep/new.svg")
-        ));
-        assert!(!created_in_glob_scope(
-            &scopes,
-            &created("/app/.wrangler/state/v3/trace-store/a.sqlite-wal")
-        ));
-        assert!(!created_in_glob_scope(
-            &scopes,
-            &created("/app/src/components/New.tsx")
-        ));
+        for (file, rebundles) in [
+            ("/app/src/modules/new/messages/fr.json", true),
+            ("/app/src/icons/deep/new.svg", true),
+            ("/app/src/icons/Deep/Logo.SVG", true),
+            ("/app/src/routes/[id]/edit.ts", true),
+            // Under a glob's scan base, matched by none of its patterns.
+            ("/app/src/modules/dashboard/components/sedf1aa6r", false),
+            ("/app/src/modules/x/New.tsx", false),
+            ("/app/src/icons/skip/a.svg", false),
+            ("/app/src/icons/.cache/a.svg", false),
+            ("/app/src/icons/node_modules/a.svg", false),
+            ("/app/src/routes/i/edit.ts", false),
+            ("/app/.wrangler/state/v3/trace-store/a.sqlite-wal", false),
+        ] {
+            assert_eq!(
+                created_in_glob_scope(&scopes, &created(file)),
+                rebundles,
+                "{file}"
+            );
+        }
         assert!(!created_in_glob_scope(
             &[],
-            &created("/app/src/content/x.json")
+            &created("/app/src/modules/new/messages/fr.json")
         ));
         assert!(!created_in_glob_scope(&scopes, &Default::default()));
+
+        // A cache an older oj wrote: scan bases, matched as before.
+        std::fs::write(dir.join("glob-scopes.json"), r#"["/app/src/content"]"#).unwrap();
+        let legacy = load_client_glob_scopes(&dir);
+        assert!(created_in_glob_scope(
+            &legacy,
+            &created("/app/src/content/a/b.txt")
+        ));
+        assert!(!created_in_glob_scope(
+            &legacy,
+            &created("/app/src/other.json")
+        ));
     }
 
     // The rebundle worker tracks the regen outputs' content against what the
@@ -4842,6 +5052,73 @@ mod tests {
         assert!(
             configured_start_server_entry(&env_scoped, &root).is_some(),
             "environments.ssr.resolve.alias counts"
+        );
+    }
+
+    // Vite: with the worker rendering the documents from TanStack's own
+    // manifest, the page runs the client module graph, and an edit reaches it
+    // as that graph's HMR update; the worker environment's own update never
+    // reloads the page.
+    #[test]
+    fn worker_documents_leave_client_edits_to_the_page_hmr() {
+        let unbundled = RunSignals {
+            unbundled: true,
+            ..Default::default()
+        };
+        for edit in [
+            RunSignals {
+                server_signals: true,
+                ..unbundled
+            },
+            RunSignals {
+                server_fn_changed: true,
+                server_signals: true,
+                ..unbundled
+            },
+        ] {
+            assert!(
+                !reloads_browser(edit),
+                "an edit the page's own HMR applies reloaded it"
+            );
+        }
+        // The generated route tree never reaches that HMR (the watcher drops
+        // its writes), so a route-set change still reloads.
+        assert!(reloads_browser(RunSignals {
+            regen_changed: true,
+            ..unbundled
+        }));
+    }
+
+    #[test]
+    fn bundle_pages_reload_for_what_no_hot_update_carried() {
+        let base = RunSignals::default();
+        assert!(!reloads_browser(RunSignals {
+            hot: true,
+            bundled: true,
+            server_signals: true,
+            ..base
+        }));
+        assert!(reloads_browser(RunSignals {
+            bundled: true,
+            ..base
+        }));
+        assert!(reloads_browser(RunSignals {
+            server_signals: true,
+            ..base
+        }));
+        assert!(reloads_browser(RunSignals {
+            hot: true,
+            server_fn_changed: true,
+            ..base
+        }));
+        assert!(!reloads_browser(RunSignals {
+            bundled: true,
+            bundle_failed: true,
+            ..base
+        }));
+        assert!(
+            !reloads_browser(base),
+            "a change outside every graph reloads nothing"
         );
     }
 }

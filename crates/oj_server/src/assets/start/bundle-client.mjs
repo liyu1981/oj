@@ -32,6 +32,7 @@ import {
 } from "./rolldown-assets.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob, transformImportMetaUrl, depImportMetaUrlPlugin, bundlerResolve } from "./glob-transform.mjs";
+import { loadViteGlobs } from "./vite-globs.mjs";
 import { rewriteClientServerFns } from "./server-fns.mjs";
 import { pathToFileURL } from "node:url";
 
@@ -278,6 +279,7 @@ async function main() {
   // output is indistinguishable from one that never started.
   process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} client bundling\n`);
   const { build } = await importOjRolldown(APP, ["vite", "@tanstack/react-start"]);
+  await loadViteGlobs(APP);
   const parseAst = await importOjRolldownParseAst(APP, ["vite", "@tanstack/react-start"]);
   phase("client bundle: rolldown imported");
   const WORKSPACE = workspaceRoot(APP);
@@ -357,9 +359,9 @@ async function main() {
   phase("client bundle: plugin container loaded");
 
   const cssUrls = [];
-  // Every import.meta.glob scan base this bundle expanded; the dev rebundle
-  // gate rebundles for a file CREATED under one (the glob's expansion grows),
-  // and for no other create, mirroring Vite's add handling.
+  // Every import.meta.glob this bundle expanded, as match specs; the dev
+  // rebundle gate rebundles for a CREATED file one matches (the glob's
+  // expansion grows), and for no other create, mirroring Vite's add handling.
   const globScopes = new Set();
 
   const visitedIds = new Set();
@@ -644,7 +646,7 @@ async function main() {
     })
     .sort();
   writeFileSync(join(HERE, "closure.json"), JSON.stringify(closureFiles));
-  writeFileSync(join(HERE, "glob-scopes.json"), JSON.stringify([...liveGlobScopes].sort()));
+  writeFileSync(join(HERE, "glob-scopes.json"), JSON.stringify([...liveGlobScopes].sort().map((s) => JSON.parse(s))));
   if (live) live.closure = new Set(closureFiles);
 
   phase("client bundle: closure written");

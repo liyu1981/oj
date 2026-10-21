@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { resolve, dirname, join, relative, sep } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { resolve, dirname, join, posix, relative, sep } from "node:path";
+import { globFiles, globSafePath } from "./vite-globs.mjs";
 
 const GLOB_HEAD = /import\.meta\.glob\b/g;
 
@@ -36,101 +37,29 @@ function callArgsStart(code, from) {
   return code[i] === "(" ? i + 1 : -1;
 }
 
-function globToRegExp(absGlob, flags = "") {
-  let re = "";
-  for (let i = 0; i < absGlob.length; i++) {
-    const c = absGlob[i];
-    if (c === "*") {
-      if (absGlob[i + 1] === "*") {
-        re += "(?:.*)";
-        i++;
-        if (absGlob[i + 1] === "/") i++;
-      } else {
-        re += "[^/]*";
-      }
-    } else if (c === "?") {
-      re += "[^/]";
-    } else if (c === "{") {
-      const end = absGlob.indexOf("}", i);
-      if (end === -1) {
-        re += "\\{";
-        continue;
-      }
-      re +=
-        "(?:" +
-        absGlob
-          .slice(i + 1, end)
-          .split(",")
-          .map((s) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&"))
-          .join("|") +
-        ")";
-      i = end;
-    } else if ("+^$.()|[]\\".includes(c)) {
-      re += "\\" + c;
-    } else {
-      re += c;
-    }
-  }
-  return new RegExp("^" + re + "$", flags);
-}
-
-function walk(dir, out) {
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    const p = dir + sep + e.name;
-    if (e.isDirectory()) walk(p, out);
-    else if (e.isFile()) out.push(p);
-  }
-}
-
 // Vite's toAbsoluteGlob: `/x` is project-root relative, `./x` and `../x`
 // resolve against the importer's directory or, with the `base` option,
-// against that base (itself root-relative when it starts with `/`); anything
-// else (an alias, a bare id) keeps resolving against the importer's directory.
-function absGlobOf(pattern, fileDir, root, base) {
-  const dir = base ? (base[0] === "/" ? join(root, base) : resolve(fileDir, base)) : fileDir;
-  if (pattern.startsWith("/")) return join(root, pattern.slice(1));
-  if (pattern.startsWith("./")) return join(dir, pattern.slice(2));
-  if (pattern.startsWith("../")) return join(dir, pattern);
-  return resolve(fileDir, pattern);
-}
-
-// The directory a glob's scan walks: up to the last separator before the
-// first wildcard, or the pattern's own directory when it has none.
-export function globBase(absGlob) {
-  absGlob = absGlob.split(sep).join("/");
-  const starIdx = absGlob.search(/[*?{]/);
-  return starIdx === -1 ? dirname(absGlob) : absGlob.slice(0, absGlob.lastIndexOf("/", starIdx));
-}
-
-function matchPattern(absGlob, exhaustive = false, caseSensitive = true) {
-  absGlob = absGlob.split(sep).join("/");
-  const base = globBase(absGlob);
-  // Vite: `caseSensitive: false` matches with nocase (an `Icon.svg` pattern
-  // finds `icon.svg`).
-  const re = globToRegExp(absGlob, caseSensitive ? "" : "i");
-  const explicitHidden = absGlob
-    .slice(base.length + 1)
-    .split("/")
-    .filter((part) => part.startsWith("."))
-    .map((part) => globToRegExp(part));
-  const all = [];
-  walk(base.split("/").join(sep), all);
-  return all.filter((f) => {
-    const normalized = f.split(sep).join("/");
-    if (!re.test(normalized)) return false;
-    // Vite globs with `dot: !!exhaustive` and ignores node_modules unless
-    // `exhaustive: true`; a literal dot segment in the pattern still matches.
-    if (exhaustive) return true;
-    const parts = normalized.slice(base.length + 1).split("/");
-    if (parts.includes("node_modules")) return false;
-    return parts.every((part) => !part.startsWith(".") || explicitHidden.some((pattern) => pattern.test(part)));
-  });
+// against that base (itself root-relative when it starts with `/`), a `!**`
+// negation stays as written, and anything else (an alias, a bare id, which
+// Vite hands its resolver) resolves against the importer's directory. The
+// path prefixes are glob-escaped (Vite's globSafePath), so a `(group)` or
+// `[id]` directory is matched literally. One departure: Vite leaves a
+// positive `**` pattern as written too, which walks from `/`; oj walks it
+// from the root, as its dev server does.
+function toAbsoluteGlob(glob, fileDir, root, base) {
+  let pre = "";
+  if (glob[0] === "!") {
+    pre = "!";
+    glob = glob.slice(1);
+  }
+  const safeRoot = globSafePath(root);
+  const safeDir = globSafePath(fileDir);
+  const dir = base ? (base[0] === "/" ? posix.join(safeRoot, base) : posix.resolve(safeDir, base)) : safeDir;
+  if (glob[0] === "/") return pre + posix.join(safeRoot, glob.slice(1));
+  if (glob.startsWith("./")) return pre + posix.join(dir, glob.slice(2));
+  if (glob.startsWith("../")) return pre + posix.join(dir, glob);
+  if (glob.startsWith("**")) return pre + (pre ? glob : posix.join(safeRoot, glob));
+  return pre + posix.join(safeDir, glob);
 }
 
 const toRel = (fileDir, abs) => {
@@ -179,11 +108,13 @@ function normalizeOptions(opts) {
   return out;
 }
 
-// `scopes` (a Set, optional): collects every include pattern's scan base, the
-// directories where a CREATED file can change a glob's expansion. The dev
-// rebundle gate consumes them: Vite re-expands glob importers when a file is
-// added under a globbed scope, and nothing else about a new file changes a
-// bundle whose inputs all resolved.
+// `scopes` (a Set, optional): collects each glob call as Vite matches added
+// files against it (JSON of `{ patterns, exhaustive, caseSensitive }`, the
+// patterns resolved as Vite resolves them). The dev rebundle gate
+// (oj_compiler::glob::GlobMatcher) consumes them: Vite re-expands a glob's
+// importer when an added file matches its patterns, and nothing else about a
+// new file changes a bundle whose inputs all resolved. Vite's glob libraries
+// must be loaded first (vite-globs.mjs `loadViteGlobs`).
 export function transformGlob(code, filePath, root = process.env.OJ_APP_ROOT ?? process.cwd(), scopes = null) {
   if (!code.includes("import.meta.glob")) return code;
   const fileDir = dirname(filePath);
@@ -225,16 +156,13 @@ export function transformGlob(code, filePath, root = process.env.OJ_APP_ROOT ?? 
     } catch (e) {
       throw new Error(`${e.message} (import.meta.glob in ${filePath})`);
     }
-    const includes = patterns.filter((p) => !p.startsWith("!"));
-    const excludes = patterns.filter((p) => p.startsWith("!")).map((p) => p.slice(1));
     const exhaustive = opts.exhaustive === true;
     const caseSensitive = opts.caseSensitive !== false;
     const base = typeof opts.base === "string" ? opts.base : null;
     const isRelative = patterns.every((p) => ".!".includes(p[0]));
-    if (scopes) for (const p of includes) scopes.add(globBase(absGlobOf(p, fileDir, root, base)));
-    const match = (p) => matchPattern(absGlobOf(p, fileDir, root, base), exhaustive, caseSensitive);
-    const exclude = new Set(excludes.flatMap(match));
-    const files = [...new Set(includes.flatMap(match))].filter((f) => !exclude.has(f) && f !== filePath).sort();
+    const globsResolved = patterns.map((p) => toAbsoluteGlob(p, fileDir, root, base));
+    scopes?.add(JSON.stringify({ patterns: globsResolved, exhaustive, caseSensitive }));
+    const files = globFiles(globsResolved, { exhaustive, caseSensitive, cwd: root }).filter((f) => f !== filePath);
     let query =
       typeof opts.query === "string"
         ? opts.query
