@@ -3616,6 +3616,11 @@ async function transform(code, id, resolvedJson) {
     if (id) seenIds.add(id);
     let current = code;
     const maps = [];
+    // Who returned each map, so a bundle can name a map it cannot read.
+    const mapPlugins = [];
+    // Rollup's missing map: a plugin that returns code without `map` breaks
+    // the chain (`map: null` does not). Only a bundle reads it.
+    let mapBroken = null;
     const transformOptions = { ssr: environment && environment.name === "ssr" };
     let stripped = !viteTransformWithOxc || !id || id.startsWith("\0") || !oxcStripMatches(id);
     // Vite sorts a hook's plugins by the hook's own `order` (pre, normal, post)
@@ -3639,7 +3644,10 @@ async function transform(code, id, resolvedJson) {
             throw decoratePluginError(e, { name: "vite:oxc" }, id);
           }
           current = r.code;
-          if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
+          if (r.map != null) {
+            maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
+            mapPlugins.push("vite:oxc");
+          }
         }
       }
       if (!hookTransformMatches(p.transform, id, current)) continue;
@@ -3652,10 +3660,14 @@ async function transform(code, id, resolvedJson) {
       if (r == null) continue;
       if (typeof r === "string") {
         current = r;
+        mapBroken ??= p.name ?? "?";
         continue;
       }
       if (r.code != null) current = r.code;
-      if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
+      if (r.map != null) {
+        maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
+        mapPlugins.push(p.name ?? "?");
+      } else if (r.code != null && r.map === undefined) mapBroken ??= p.name ?? "?";
       updateModuleInfo(id, r);
     }
     const prior = moduleInfoCache.get(id);
@@ -3677,6 +3689,8 @@ async function transform(code, id, resolvedJson) {
       code: current,
       watchFiles: [...bucket],
       maps,
+      mapPlugins,
+      mapBroken,
       emittedChunks: chunkBucket,
     });
   };
@@ -4346,12 +4360,24 @@ async function renderChunk(code, chunkJson) {
   const root = resolvedConfig?.root ?? initial.config?.root ?? process.cwd();
   const options = { dir: pathResolve(root, outDir), format: "es" };
   let current = code;
+  const maps = [];
+  const mapPlugins = [];
+  let mapBroken = null;
   for (const { p, fn } of pluginsWithHook("renderChunk")) {
     const r = await fn.call(ctxFor(p), current, chunk, options);
     if (r == null) continue;
-    current = typeof r === "string" ? r : (r.code ?? current);
+    if (typeof r === "string") {
+      current = r;
+      mapBroken ??= p.name ?? "?";
+      continue;
+    }
+    if (r.code != null) current = r.code;
+    if (r.map != null) {
+      maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
+      mapPlugins.push(p.name ?? "?");
+    } else if (r.code != null && r.map === undefined) mapBroken ??= p.name ?? "?";
   }
-  return current;
+  return JSON.stringify({ code: current, maps, mapPlugins, mapBroken });
 }
 
 async function writeBundle(bundleJson, isWrite) {

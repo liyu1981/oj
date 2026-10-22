@@ -22,9 +22,8 @@ use rolldown_common::{ModuleType, ResolvedExternal};
 use rolldown_plugin::{
     HookLoadArgs, HookLoadOutput, HookLoadReturn, HookRenderChunkArgs, HookRenderChunkOutput,
     HookRenderChunkReturn, HookResolveIdArgs, HookResolveIdOutput, HookResolveIdReturn,
-    HookTransformArgs, HookTransformOutput, HookTransformOutputMap, HookTransformReturn, Plugin,
-    PluginContext, PluginContextResolveOptions, SharedLoadPluginContext,
-    SharedTransformPluginContext,
+    HookTransformArgs, HookTransformOutput, HookTransformReturn, Plugin, PluginContext,
+    PluginContextResolveOptions, SharedLoadPluginContext, SharedTransformPluginContext,
 };
 
 use super::facts::Facts;
@@ -127,6 +126,7 @@ pub(crate) struct StartHostPlugin {
     lifecycle: bool,
     render_chunk_enabled: Arc<tokio::sync::OnceCell<bool>>,
     warned_virtual: Mutex<HashSet<String>>,
+    map_warnings: Arc<crate::build::MapWarnings>,
 }
 
 impl std::fmt::Debug for StartHostPlugin {
@@ -156,6 +156,7 @@ impl StartHostPlugin {
             lifecycle: true,
             render_chunk_enabled: Arc::new(tokio::sync::OnceCell::new()),
             warned_virtual: Mutex::new(HashSet::new()),
+            map_warnings: Arc::default(),
         }
     }
 
@@ -466,17 +467,25 @@ impl Plugin for StartHostPlugin {
             && self.host.hook_wants_transform(id, code);
         let host = Arc::clone(&self.host);
         let emit = Arc::clone(&self.emit);
+        let sourcemap = ctx.inner.options().is_sourcemap_enabled();
+        let warnings = (self.command == Command::Build).then(|| Arc::clone(&self.map_warnings));
         async move {
             if !pass {
                 return Ok(None);
             }
-            let (out, _, _, chunks) = host
+            let t = host
                 .transform(code, id, "{}")
                 .await
                 .map_err(|e| anyhow::anyhow!("plugin transform failed for {id}:\n{e}"))?;
-            crate::build::forward_emitted_chunks(&ctx.inner, &chunks, &emit);
-            Ok((out != code).then(|| HookTransformOutput {
-                code: Some(out),
+            crate::build::forward_emitted_chunks(&ctx.inner, &t.chunks, &emit);
+            Ok((t.code != code).then(|| HookTransformOutput {
+                map: crate::build::host_chain_map(
+                    sourcemap,
+                    &t,
+                    crate::build::ChainHook::Transform,
+                    warnings.as_deref(),
+                ),
+                code: Some(t.code),
                 ..Default::default()
             }))
         }
@@ -519,6 +528,8 @@ impl Plugin for StartHostPlugin {
         let host = Arc::clone(&self.host);
         let enabled = Arc::clone(&self.render_chunk_enabled);
         let code = Arc::clone(&args.code);
+        let sourcemap = args.options.is_sourcemap_enabled();
+        let warnings = (self.command == Command::Build).then(|| Arc::clone(&self.map_warnings));
         let chunk_json = if enabled.get() == Some(&false) {
             String::new()
         } else {
@@ -536,9 +547,14 @@ impl Plugin for StartHostPlugin {
                 .await
                 .map_err(|e| anyhow::anyhow!("plugin renderChunk failed:\n{e}"))?
             {
-                Some(out) if out != *code => Ok(Some(HookRenderChunkOutput {
-                    code: out,
-                    map: HookTransformOutputMap::Null,
+                t if t.code != *code => Ok(Some(HookRenderChunkOutput {
+                    map: crate::build::host_chain_map(
+                        sourcemap,
+                        &t,
+                        crate::build::ChainHook::RenderChunk,
+                        warnings.as_deref(),
+                    ),
+                    code: t.code,
                 })),
                 _ => Ok(None),
             }
