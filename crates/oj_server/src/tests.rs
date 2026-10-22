@@ -884,29 +884,6 @@ fn restart_triggers_include_every_config_flavor() {
     }
 }
 
-// inotify's open/read/close events are dropped before any batch loop sees
-// them; real changes still pass.
-#[test]
-fn access_events_are_noise_and_changes_are_not() {
-    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
-    use notify::{Event, EventKind};
-    for kind in [
-        EventKind::Access(AccessKind::Open(AccessMode::Any)),
-        EventKind::Access(AccessKind::Read),
-        EventKind::Access(AccessKind::Close(AccessMode::Read)),
-        EventKind::Access(AccessKind::Close(AccessMode::Write)),
-    ] {
-        assert!(crate::watch::is_access(&Event::new(kind)), "{kind:?}");
-    }
-    for kind in [
-        EventKind::Create(CreateKind::File),
-        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
-        EventKind::Remove(notify::event::RemoveKind::File),
-    ] {
-        assert!(!crate::watch::is_access(&Event::new(kind)), "{kind:?}");
-    }
-}
-
 #[test]
 fn tsconfig_files_trigger_the_reload_path() {
     for f in ["tsconfig.json", "app/tsconfig.json", "tsconfig.base.json"] {
@@ -2173,4 +2150,177 @@ fn watched_files_cover_what_the_root_watch_covers() {
     }
     assert_eq!(watched_files(&root), want);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// Zed's reading of a rescan: an inotify overflow has no path (the whole
+// root), FSEvents' MustScanSubDirs names a subtree or an ancestor of the root
+// (the whole root), and a subtree the root watch leaves out is no rescan.
+#[test]
+fn rescan_roots_read_overflow_and_must_scan_subdirs() {
+    use notify::event::Flag;
+    use notify::{Event, EventKind};
+    let root = Path::new("/app");
+    let cache = Path::new("/app/.oj-cache");
+    let ignored = watch_ignored_patterns(root, &["generated".to_string()]);
+    let rescan = |paths: &[&str]| {
+        let mut ev = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        ev.paths = paths.iter().map(PathBuf::from).collect();
+        crate::watch::rescan_roots(&ignored, root, cache, &ev)
+    };
+    assert_eq!(rescan(&[]), [PathBuf::from("/app")], "inotify overflow");
+    assert_eq!(rescan(&["/"]), [PathBuf::from("/app")], "an ancestor");
+    assert_eq!(
+        rescan(&["/app/src/routes"]),
+        [PathBuf::from("/app/src/routes")]
+    );
+    for skipped in [
+        "/app/node_modules/react",
+        "/app/src/pkg/node_modules",
+        "/app/.git",
+        "/app/dist",
+        "/app/.oj-cache/start",
+        "/app/generated",
+        "/elsewhere",
+    ] {
+        assert!(rescan(&[skipped]).is_empty(), "{skipped}");
+    }
+    let mut plain = Event::new(EventKind::Other);
+    plain.paths = vec![PathBuf::from("/app/src")];
+    assert!(crate::watch::rescan_roots(&ignored, root, cache, &plain).is_empty());
+
+    let collapsed = crate::watch::collapse_rescans(
+        [
+            "/app/src/a",
+            "/app/src",
+            "/app/src-b",
+            "/app/lib/x",
+            "/app/lib/x",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect(),
+    );
+    assert_eq!(
+        collapsed,
+        ["/app/lib/x", "/app/src", "/app/src-b"].map(PathBuf::from)
+    );
+}
+
+// A rescan diffs the subtree against the watcher's snapshot, as Zed's does:
+// unknown files are adds (a moved-in tree keeps its old mtimes), known paths
+// gone are removals, known files whose mtime, inode or size moved are edits
+// (a rename onto one brings its own inode), and directories it never knew,
+// or knew under another inode or birth, are new and get re-armed. A chmod, untouched
+// files, ignored paths and node_modules stay silent.
+#[test]
+fn rescan_changes_diff_against_the_known_files() {
+    let base = std::env::temp_dir().join(format!("oj-rescan-diff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("app")).unwrap();
+    let base = std::fs::canonicalize(&base).unwrap();
+    let root = base.join("app");
+    let write = |p: &Path, body: &str| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    let old = SystemTime::now() - Duration::from_secs(3600);
+    let age = |p: &Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap()
+    };
+    for rel in [
+        "src/edited.ts",
+        "src/gone.ts",
+        "src/replaced.ts",
+        "src/untouched.ts",
+        "src/chmod.ts",
+        "src/recreated/a.ts",
+        "generated/a.ts",
+        "index.html",
+    ] {
+        let p = root.join(rel);
+        write(&p, "x");
+        age(&p);
+    }
+    let staged = base.join("staged/tree/inner.ts");
+    write(&staged, "x");
+    age(&staged);
+    let cache = root.join(".oj-cache");
+    let ignored = watch_ignored_patterns(&root, &["**/generated/**".to_string()]);
+    let known = crate::watch::boot_snapshot(&ignored, &root, &cache);
+    assert!(
+        known.contains_key(&root.join("src")),
+        "directories are known"
+    );
+    assert!(known.contains_key(&root.join("src/recreated")));
+    assert!(
+        !known.contains_key(&root.join("generated/a.ts")),
+        "ignored paths stay out of the snapshot"
+    );
+
+    write(&root.join("src/edited.ts"), "yy");
+    std::fs::remove_file(root.join("src/gone.ts")).unwrap();
+    let tmp = root.join("src/.replaced.ts.tmp");
+    write(&tmp, "z");
+    age(&tmp);
+    std::fs::rename(&tmp, root.join("src/replaced.ts")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("src/chmod.ts"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let added = root.join("src/added.ts");
+    write(&added, "n");
+    age(&added);
+    std::fs::rename(staged.parent().unwrap(), root.join("src/moved")).unwrap();
+    // Deleted and recreated under the same path, the freed inode possibly
+    // handed back: a new birth, and no watch.
+    std::fs::remove_dir_all(root.join("src/recreated")).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    write(&root.join("src/recreated/a.ts"), "xy");
+    write(&root.join("generated/b.ts"), "x");
+    write(&root.join("node_modules/dep/index.js"), "x");
+    write(&root.join("src/pkg/node_modules/a.js"), "x");
+
+    let found =
+        crate::watch::rescan_changes(std::slice::from_ref(&root), &ignored, &root, &cache, &known);
+    assert_eq!(
+        found.added,
+        [root.join("src/added.ts"), root.join("src/moved/inner.ts")]
+    );
+    assert_eq!(
+        found.changed,
+        [
+            root.join("src/edited.ts"),
+            root.join("src/recreated/a.ts"),
+            root.join("src/replaced.ts"),
+        ]
+    );
+    assert_eq!(found.removed, [root.join("src/gone.ts")]);
+    let mut new_dirs = vec![root.join("src/moved"), root.join("src/pkg")];
+    // Only a filesystem that keeps birth times can tell a reused inode.
+    if crate::watch::stamp(&root.join("src/recreated"))
+        .unwrap()
+        .born
+        .is_some()
+    {
+        new_dirs.push(root.join("src/recreated"));
+    }
+    assert_eq!(found.new_dirs, new_dirs);
+
+    // A subtree rescan reports only under it.
+    let sub =
+        crate::watch::rescan_changes(&[root.join("src/moved")], &ignored, &root, &cache, &known);
+    assert_eq!(sub.added, [root.join("src/moved/inner.ts")]);
+    assert_eq!(sub.new_dirs, [root.join("src/moved")]);
+    assert!(sub.changed.is_empty() && sub.removed.is_empty());
+    let _ = std::fs::remove_dir_all(&base);
 }

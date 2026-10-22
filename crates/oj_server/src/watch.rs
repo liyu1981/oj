@@ -422,13 +422,19 @@ pub fn capture_startup_cwd() {
     }
 }
 
-/// inotify reports every open, read and close as an Access event; none is a
-/// change, and chokidar's fs.watch never sees them. Dropped at the source:
-/// a file someone keeps reading (an editor, an indexer, a poller) otherwise
-/// floods the batch loops, whose settle window restarts on every event, so
-/// an edit landing in that stream is never handed off.
-pub(crate) fn is_access(ev: &notify::Event) -> bool {
-    matches!(ev.kind, notify::EventKind::Access(_))
+/// A watcher subscribed to changes only, as Zed's is. inotify reports every
+/// open and close of a watched path; none is a change, and chokidar's
+/// fs.watch never sees them. With the mask they never reach the queue (on the
+/// other backends notify filters them): a file someone keeps reading (an
+/// editor, an indexer, a poller) otherwise flooded the batch loops, whose
+/// settle window restarts on every event, so an edit landing in that stream
+/// was never handed off, and reads alone could overflow the queue.
+fn new_watcher<F: notify::EventHandler>(handler: F) -> notify::Result<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    notify::RecommendedWatcher::new(
+        handler,
+        notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+    )
 }
 
 /// The watcher thread's inbox: filesystem notifications, and directories to
@@ -571,7 +577,7 @@ impl Watchers {
             return Ok(());
         }
         let sink = Arc::clone(&self.sink);
-        let mut watcher = notify::recommended_watcher(move |ev| sink(ev))?;
+        let mut watcher = new_watcher(move |ev| sink(ev))?;
         watcher.watch(path, mode)?;
         self.own.insert(path.to_path_buf(), watcher);
         Ok(())
@@ -654,18 +660,22 @@ pub(crate) fn created_dirs(
     }
     ev.paths
         .iter()
-        .filter(|path| {
-            let Ok(rel) = path.strip_prefix(root) else {
-                return false;
-            };
-            let mut parts = rel.components().map(|c| c.as_os_str());
-            !parts.clone().any(|c| c == "node_modules" || c == ".git")
-                && !parts.next().is_some_and(is_unwatched_dir)
-                && !watch_excluded(ignored, root, cache_base, path)
-                && path.is_dir()
-        })
+        .filter(|path| watched_subtree(ignored, root, cache_base, path) && path.is_dir())
         .cloned()
         .collect()
+}
+
+/// A path under the root the root watch covers: not inside what Vite's
+/// chokidar ignores (`**/node_modules/**`, `**/.git/**`, the cache dir,
+/// `server.watch.ignored`) nor a top-level dir the root watch leaves out.
+fn watched_subtree(ignored: &[glob::Pattern], root: &Path, cache_base: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = rel.components().map(|c| c.as_os_str());
+    !parts.clone().any(|c| c == "node_modules" || c == ".git")
+        && !parts.next().is_some_and(is_unwatched_dir)
+        && !watch_excluded(ignored, root, cache_base, path)
 }
 
 /// A directory created after boot: a top-level one, caught by the root's
@@ -700,6 +710,11 @@ fn adopt_created_dirs(
 /// any depth (`node_modules`, `.git`). Symlinked directories are not entered:
 /// one pointing back up the tree would never end.
 pub(crate) fn scan_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    scan_tree(dir, out, &mut Vec::new());
+}
+
+/// `scan_files`, also collecting the directories it entered.
+fn scan_tree(dir: &Path, out: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -708,7 +723,8 @@ pub(crate) fn scan_files(dir: &Path, out: &mut Vec<PathBuf>) {
         match entry.file_type() {
             Ok(t) if t.is_dir() => {
                 if !matches!(entry.file_name().to_str(), Some("node_modules" | ".git")) {
-                    scan_files(&path, out);
+                    dirs.push(path.clone());
+                    scan_tree(&path, out, dirs);
                 }
             }
             Ok(t) if t.is_symlink() && path.is_dir() => {}
@@ -729,19 +745,183 @@ pub fn watched_files(root: &Path) -> std::collections::HashSet<PathBuf> {
         let base = oj_cache::cache_base(&root);
         std::fs::canonicalize(&base).unwrap_or(base)
     };
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+    let mut files = Vec::new();
+    scan_watched(&root, &cache_base, &mut files, &mut Vec::new());
+    files.into_iter().collect()
+}
+
+/// `watched_files` and the directories holding them, spelled under `root`
+/// as given.
+fn scan_watched(root: &Path, cache_base: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let path = entry.path();
         if is_unwatched_dir(&entry.file_name()) || path == cache_base {
             continue;
         }
         if path.is_dir() {
-            scan_files(&path, &mut found);
+            dirs.push(path.clone());
+            scan_tree(&path, files, dirs);
         } else {
-            found.push(path);
+            files.push(path);
         }
     }
-    found.into_iter().collect()
+}
+
+/// The watcher's snapshot: each file and directory the root watch covers,
+/// with its stamp when last seen.
+pub(crate) type Snapshot = std::collections::HashMap<PathBuf, Stamp>;
+
+/// The boot snapshot, minus excluded paths, and minus anything stamped after
+/// the scan began: a file created while it ran has a Create queued that must
+/// still read as an add.
+pub(crate) fn boot_snapshot(ignored: &[glob::Pattern], root: &Path, cache_base: &Path) -> Snapshot {
+    let began = SystemTime::now();
+    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+    scan_watched(root, cache_base, &mut files, &mut dirs);
+    files
+        .into_iter()
+        .chain(dirs)
+        .filter(|p| !watch_excluded(ignored, root, cache_base, p))
+        .filter_map(|p| Some((p.clone(), stamp(&p)?)))
+        .filter(|(_, s)| s.mtime < began)
+        .collect()
+}
+
+/// The subtrees a rescan event says the watcher lost track of, as Zed reads
+/// them: an inotify queue overflow carries no path and means the whole root;
+/// FSEvents' MustScanSubDirs names a subtree, at times an ancestor of the root
+/// (the whole root again). Never one the root watch leaves out.
+pub(crate) fn rescan_roots(
+    ignored: &[glob::Pattern],
+    root: &Path,
+    cache_base: &Path,
+    ev: &notify::Event,
+) -> Vec<PathBuf> {
+    if !ev.need_rescan() {
+        return Vec::new();
+    }
+    if ev.paths.is_empty() {
+        return vec![root.to_path_buf()];
+    }
+    ev.paths
+        .iter()
+        .filter_map(|p| {
+            if root.starts_with(p) {
+                Some(root.to_path_buf())
+            } else if watched_subtree(ignored, root, cache_base, p) {
+                Some(p.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// A batch's rescans collapsed, as Zed does: one per subtree, none under
+/// another.
+pub(crate) fn collapse_rescans(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort();
+    roots.dedup();
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        if !kept.iter().any(|k| r.starts_with(k)) {
+            kept.retain(|k| !k.starts_with(&r));
+            kept.push(r);
+        }
+    }
+    kept
+}
+
+/// What a rescan of `roots` finds against the watcher's snapshot (`known`),
+/// as Zed's rescan diffs its entries: files on disk it never knew are adds,
+/// known paths gone from disk are removals, known files whose stamp moved
+/// are edits, and directories it never knew (or knew as another inode or
+/// birth) are new. Untouched files stay silent, or oj would push an HMR update for every
+/// module.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Rescanned {
+    pub(crate) added: Vec<PathBuf>,
+    pub(crate) changed: Vec<PathBuf>,
+    pub(crate) removed: Vec<PathBuf>,
+    pub(crate) new_dirs: Vec<PathBuf>,
+}
+
+pub(crate) fn rescan_changes(
+    roots: &[PathBuf],
+    ignored: &[glob::Pattern],
+    root: &Path,
+    cache_base: &Path,
+    known: &Snapshot,
+) -> Rescanned {
+    let mut out = Rescanned::default();
+    let excluded = |p: &Path| watch_excluded(ignored, root, cache_base, p);
+    for r in roots {
+        let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        if r == root {
+            scan_watched(root, cache_base, &mut files, &mut dirs);
+        } else {
+            dirs.push(r.clone());
+            scan_tree(r, &mut files, &mut dirs);
+        }
+        for d in dirs.into_iter().filter(|d| !excluded(d)) {
+            let Some(now) = stamp(&d) else { continue };
+            if !known.get(&d).is_some_and(|seen| seen.same_dir(&now)) {
+                out.new_dirs.push(d);
+            }
+        }
+        for f in files.into_iter().filter(|f| !excluded(f)) {
+            match known.get(&f) {
+                None => out.added.push(f),
+                Some(seen) if stamp(&f) != Some(*seen) => out.changed.push(f),
+                Some(_) => {}
+            }
+        }
+    }
+    out.removed = known
+        .keys()
+        .filter(|p| roots.iter().any(|r| p.starts_with(r)) && !p.exists())
+        .cloned()
+        .collect();
+    out.new_dirs = collapse_rescans(out.new_dirs);
+    for list in [&mut out.added, &mut out.changed, &mut out.removed] {
+        list.sort();
+    }
+    out
+}
+
+/// What a snapshot entry compares, as Zed's entries do: mtime, inode, and
+/// size, plus birth time where the filesystem keeps one, since a path
+/// deleted and recreated can get the freed inode back. A file renamed onto
+/// a path keeps its old mtime but brings its own inode; a metadata-only
+/// change (chmod, xattrs, a new hard link) moves none of them, as the live
+/// path ignores it too. A directory compares by inode and birth alone
+/// (`same_dir`): its mtime moves with every child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    pub(crate) mtime: SystemTime,
+    pub(crate) ino: u64,
+    pub(crate) len: u64,
+    pub(crate) born: Option<SystemTime>,
+}
+
+impl Stamp {
+    fn same_dir(&self, other: &Stamp) -> bool {
+        self.ino == other.ino && self.born == other.born
+    }
+}
+
+pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some(Stamp {
+        mtime: meta.modified().unwrap_or(UNIX_EPOCH),
+        ino,
+        len: if meta.is_dir() { 0 } else { meta.len() },
+        born: meta.created().ok(),
+    })
 }
 
 /// One debounced set of changes.
@@ -751,6 +931,9 @@ struct Batch {
     /// Paths the watcher saw come into existence: plugins get "create" for
     /// those, "update" for edits, "delete" for removals.
     created: std::collections::HashSet<PathBuf>,
+    /// Subtrees the watcher lost events under (`rescan_roots`), and why.
+    rescans: Vec<PathBuf>,
+    rescan_reason: Option<String>,
 }
 
 impl Batch {
@@ -881,15 +1064,12 @@ pub(crate) fn spawn_watcher(
         );
         let sink: EventSink = Arc::new(move |ev: notify::Result<notify::Event>| {
             if let Ok(ev) = &ev {
-                if is_access(ev) {
-                    return;
-                }
                 feed.publish(ev, &ignored, &root, &cache);
             }
             let _ = tx.send(WatchMsg::Fs(ev));
         });
         let root_sink = Arc::clone(&sink);
-        let mut watchers = match notify::recommended_watcher(move |ev| root_sink(ev)) {
+        let mut watchers = match new_watcher(move |ev| root_sink(ev)) {
             Ok(root) => Watchers {
                 root,
                 sink,
@@ -908,9 +1088,13 @@ pub(crate) fn spawn_watcher(
         let _ = ready.send(true);
 
         let debounce_ms: u64 = oj_env::get().knobs.hmr_debounce_ms.unwrap_or(10);
-        // FSEvents keeps a file's "created" flag on later events for a while, so
-        // a Create for a path seen before is an edit (chokidar: add once, change after).
-        let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        // The paths the watcher knows, chokidar's watched set, with each
+        // one's stamp when last seen: the boot scan plus every path a batch
+        // named. A Create for a known path is an edit (chokidar: add once,
+        // change after; FSEvents keeps a file's "created" flag on later
+        // events for a while), and a rescan diffs against it, as Zed's does
+        // against its entries. Scanned after `ready`: events queue meanwhile.
+        let mut seen_paths = boot_snapshot(&state.watch_ignored, &state.root, &cache_base);
         let mut changes = ContentChanges::new();
         loop {
             let first = match rx.recv() {
@@ -936,7 +1120,7 @@ pub(crate) fn spawn_watcher(
                 &mut batch,
                 &first,
             );
-            if batch.paths.is_empty() {
+            if batch.paths.is_empty() && batch.rescans.is_empty() {
                 continue;
             }
             // Only a change the batch keeps restarts the quiet window: ignored
@@ -971,16 +1155,28 @@ pub(crate) fn spawn_watcher(
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
-            let Batch { paths, mut created } = batch;
+            if !batch.rescans.is_empty() {
+                rescan(
+                    &state,
+                    &mut watchers,
+                    &cache_base,
+                    &mut changes,
+                    &mut batch,
+                    &seen_paths,
+                );
+            }
+            let Batch {
+                paths, mut created, ..
+            } = batch;
             let paths: Vec<PathBuf> = paths.into_iter().collect();
-            created.retain(|p| !seen_paths.contains(p));
-            seen_paths.extend(paths.iter().cloned());
+            created.retain(|p| !seen_paths.contains_key(p));
             // chokidar reports `add` again for a path after its `unlink`, so a
             // deleted path is unseen: recreated, it is a create, not an edit.
             for p in &paths {
-                if !p.exists() {
-                    seen_paths.remove(p);
-                }
+                match stamp(p) {
+                    Some(at) => seen_paths.insert(p.clone(), at),
+                    None => seen_paths.remove(p),
+                };
             }
             handle_batch(&state, &paths, &created);
         }
@@ -998,6 +1194,14 @@ fn ingest_event(
     batch: &mut Batch,
     ev: &notify::Event,
 ) -> bool {
+    let rescans = rescan_roots(&state.watch_ignored, &state.root, cache_base, ev);
+    if !rescans.is_empty() {
+        batch.rescans.extend(rescans);
+        if let Some(info) = ev.info() {
+            batch.rescan_reason.get_or_insert_with(|| info.to_string());
+        }
+        return true;
+    }
     let mut kept = false;
     let adopted = adopt_created_dirs(watchers, &state.watch_ignored, &state.root, cache_base, ev);
     if !adopted.is_empty() {
@@ -1010,6 +1214,79 @@ fn ingest_event(
         kept |= add_watched(state, cache_base, changes, batch, &synth);
     }
     add_watched(state, cache_base, changes, batch, ev) || kept
+}
+
+/// The watcher lost events (an inotify queue overflow, FSEvents'
+/// MustScanSubDirs): as Zed does, scan the subtrees against the snapshot,
+/// re-arm the watches a directory born meanwhile never got, and hand what
+/// changed to the batch and the feed as synthesized events.
+///
+/// Only new directories are re-armed, never the whole tree: notify's `watch`
+/// walks on the thread that drains the queue, so re-walking a large tree
+/// holds the queue undrained for the whole walk, which is how an overflow
+/// raised the next one while the watch also subscribed to opens. Files a new
+/// directory gained between the scan and its watch are picked up by scanning
+/// it again after.
+fn rescan(
+    state: &ServerState,
+    watchers: &mut Watchers,
+    cache_base: &Path,
+    changes: &mut ContentChanges,
+    batch: &mut Batch,
+    known: &Snapshot,
+) {
+    let roots = collapse_rescans(std::mem::take(&mut batch.rescans));
+    let reason = batch.rescan_reason.take();
+    for r in &roots {
+        match &reason {
+            Some(why) => eprintln!(
+                "oj: file watcher lost events ({why}), rescanning {}",
+                r.display()
+            ),
+            None => eprintln!("oj: file watcher lost events, rescanning {}", r.display()),
+        }
+    }
+    let mut found = rescan_changes(&roots, &state.watch_ignored, &state.root, cache_base, known);
+    if cfg!(target_os = "linux") {
+        for d in &found.new_dirs {
+            if let Err(err) = watchers.watch(d, notify::RecursiveMode::Recursive) {
+                eprintln!("oj: cannot watch {}: {err}", d.display());
+            }
+            let mut late = Vec::new();
+            scan_files(d, &mut late);
+            found
+                .added
+                .extend(late.into_iter().filter(|f| !known.contains_key(f)));
+        }
+        found.added.sort();
+        found.added.dedup();
+    }
+    for (kind, paths) in [
+        (
+            notify::EventKind::Create(notify::event::CreateKind::Any),
+            found.added,
+        ),
+        (
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            found.changed,
+        ),
+        (
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+            found.removed,
+        ),
+    ] {
+        if paths.is_empty() {
+            continue;
+        }
+        let mut synth = notify::Event::new(kind);
+        synth.paths = paths;
+        state
+            .watch_feed
+            .publish(&synth, &state.watch_ignored, &state.root, cache_base);
+        add_watched(state, cache_base, changes, batch, &synth);
+    }
 }
 
 /// `ev` into the batch minus its excluded paths; true when it changed a
