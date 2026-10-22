@@ -21,9 +21,7 @@ const oj = process.env.OJ_BIN ?? path.join(repo, "target", "debug", "oj");
 const PORT = 6861;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const installed =
-  fs.existsSync(path.join(fixture, "node_modules", "@tanstack", "react-start")) &&
-  fs.existsSync(path.join(fixture, "node_modules", "rolldown"));
+const installed = fs.existsSync(path.join(fixture, "node_modules", "@tanstack", "react-start"));
 if (!installed) {
   console.log("SKIP start rebundle gate: fixture deps not installed");
   console.log("  enable with: (cd e2e/fixtures/start-app && npm install)");
@@ -127,8 +125,15 @@ try {
   // The SSR document's freshness is the engine's own path, as above.
   const chunksHold = (needle) => {
     const dir = path.join(app, ".oj-cache");
-    return fs
-      .readdirSync(dir, { recursive: true })
+    let files;
+    try {
+      files = fs.readdirSync(dir, { recursive: true });
+    } catch {
+      // The bundle store renames its temp dir into place mid-walk; the
+      // next probe sees the settled tree.
+      return false;
+    }
+    return files
       .filter((f) => String(f).endsWith(".js"))
       .some((f) => {
         try {
