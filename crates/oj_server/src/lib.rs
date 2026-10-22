@@ -1620,6 +1620,7 @@ impl DevServer {
             // are resolved once from it); dev output is never minified.
             targets: oj_config::build_css_targets(&config),
             minify: false,
+            production: false,
             modules: css_modules_options(&config),
             lightning: css_lightning_options(&config),
         };

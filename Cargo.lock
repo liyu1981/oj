@@ -6306,6 +6306,7 @@ dependencies = [
  "base64 0.22.1",
  "grass",
  "lightningcss",
+ "oxc_resolver",
  "parcel_sourcemap",
  "proptest",
  "regex",
