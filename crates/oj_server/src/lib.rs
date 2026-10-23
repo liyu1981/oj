@@ -1321,6 +1321,18 @@ fn build_router(
     if hmr_ws_path != HMR_WS_PATH && hmr_ws_path != "/" && !hmr_ws_path.starts_with("/@oj/") {
         app = app.route(hmr_ws_path, get(ws_upgrade));
     }
+    // The base strip must run before route matching. A layer runs after its
+    // router picked a route, so it sits on an outer router whose only route is
+    // the inner one, which then matches the stripped path.
+    if let Some(base) = state.base.clone() {
+        let routes = app.with_state(Arc::clone(&state));
+        app = Router::new()
+            .fallback_service(routes)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::<str>::from(base),
+                base_middleware,
+            ));
+    }
     // Layer order is reversed at request time (last added runs first). Vite's
     // sequence is cors, host validation, proxy: proxied requests bypass neither gate.
     if !state.proxy.is_empty() {
@@ -1739,7 +1751,7 @@ impl DevServer {
             html_env: installed.html_env,
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
-            base: config.base.clone().filter(|b| b != "/"),
+            base: dev_base(config.base.as_deref()),
             buffered_frame: Mutex::new(None),
             resolve_failed: Mutex::new(std::collections::HashSet::new()),
             client_js_etag: format!(
