@@ -22,7 +22,7 @@ import { dirname, isAbsolute, join, posix, relative, resolve as pathResolve } fr
 import { foldIncludeSnapshot } from "./discovered-deps.mjs";
 import { appViteEntry, asNode } from "./vite-config-node.mjs";
 import { OJ_NATIVE_PLUGIN_NAMES, OJ_UNSUPPORTED_PLUGIN_NAMES } from "./native-plugins.mjs";
-import { idFilterRegExp, loadViteGlobs } from "./start/vite-globs.mjs";
+import { idFilterGlob, idFilterRegExp, loadViteGlobs } from "./start/vite-globs.mjs";
 import {
   applyHtmlTransforms,
   createHtmlProxy,
@@ -3909,6 +3909,28 @@ function hookOrderRank(hook) {
   const o = hook && typeof hook === "object" ? hook.order : undefined;
   return o === "pre" ? -1 : o === "post" ? 1 : 0;
 }
+// A hook `filter`'s include patterns as oj's Rust-side gates take them
+// (HookFilter::from_json, which may only over-approximate the host's own
+// matching): a RegExp as its source and flags, a string id pattern as Vite's
+// cwd-joined picomatch glob, a string code pattern as a literal (Vite's
+// `code.includes`). null when a pattern is neither, so the gate fails open.
+function gatePatterns(inc, kind) {
+  if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
+    inc = inc.include;
+  }
+  const list = Array.isArray(inc) ? inc : inc != null ? [inc] : [];
+  const out = [];
+  for (const r of list) {
+    if (typeof r === "string") {
+      out.push(kind === "id" ? { glob: idFilterGlob(r, initial.config?.root ?? process.cwd()) } : { literal: r });
+    } else if (r instanceof RegExp) {
+      out.push({ source: r.source, flags: r.flags });
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
 function pluginsWithHook(name) {
   const out = [];
   for (const p of plugins) {
@@ -4692,32 +4714,8 @@ async function run(hook, args) {
     // gate must only ever OVER-approximate, so anything it cannot represent
     // exactly makes that plugin "unfiltered" (always called): function-form
     // hooks, filters without includes (exclude- or moduleType-only), and
-    // string patterns (rolldown treats them as globs, not literals).
-    const regexes = (inc) => {
-      if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
-        inc = inc.include;
-      }
-      const list = Array.isArray(inc) ? inc : inc != null ? [inc] : [];
-      const out = [];
-      for (const r of list) {
-        if (!(r instanceof RegExp)) return null;
-        // i/s change what the pattern matches and Rust supports them inline;
-        // g/y/d only affect JS-side statefulness or match metadata, not the
-        // language. m cannot be carried: JS multiline anchors honor \r and
-        // \u2028, Rust's (?m) only \n, so an m-filtered plugin could be
-        // under-matched on CRLF sources. Any uncarryable flag (m, u, v, ...)
-        // fails the whole plugin open rather than risking an under-match.
-        if (/[^isgyd]/.test(r.flags)) return null;
-        // JS perl classes are ASCII-defined (\b \w \d and their negations)
-        // while Rust's are Unicode: /\bimport\b/ matches next to a non-ASCII
-        // letter in JS but not in Rust, an under-match. Any pattern using them
-        // fails the plugin open. (\s differs too on rare code points.)
-        if (/\\[bBwWdDsS]/.test(r.source)) return null;
-        const inline = ["i", "s"].filter((f) => r.flags.includes(f)).join("");
-        out.push(inline ? `(?${inline})${r.source}` : r.source);
-      }
-      return out;
-    };
+    // patterns gatePatterns cannot carry (Rust fails the ones it cannot
+    // translate open on its side).
     const planFor = (name, withCode) => {
       // The transform RPC is what fires moduleParsed AND fills the module-info
       // map that this.getModuleInfo()/getModuleIds() read from later hooks, so
@@ -4743,11 +4741,11 @@ async function run(hook, args) {
         if (typeof hookHandler(h) !== "function") continue;
         present = true;
         const f = h && typeof h === "object" ? h.filter : null;
-        const id = f ? regexes(f.id) : null;
-        const code = withCode && f ? regexes(f.code) : null;
+        const id = f ? gatePatterns(f.id, "id") : null;
+        const code = withCode && f ? gatePatterns(f.code, "code") : null;
         const idHas = Array.isArray(id) && id.length > 0;
         const codeHas = Array.isArray(code) && code.length > 0;
-        // A pattern set regexes() refused (null) or a filter with no usable
+        // A pattern set gatePatterns refused (null) or a filter with no usable
         // includes cannot gate; that plugin must always be offered the module.
         if (
           (id === null && f && f.id != null) ||
@@ -4817,14 +4815,7 @@ async function run(hook, args) {
     for (const p of plugins) {
       const t = p && p.transform;
       const f = t && typeof t === "object" ? t.filter : null;
-      let inc = f && f.code;
-      if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
-        inc = inc.include;
-      }
-      for (const r of Array.isArray(inc) ? inc : inc != null ? [inc] : []) {
-        if (r instanceof RegExp) pats.push(r.source);
-        else if (typeof r === "string") pats.push(r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-      }
+      if (f && f.code != null) pats.push(...(gatePatterns(f.code, "code") ?? [{ any: true }]));
     }
     return JSON.stringify(pats);
   }
@@ -4838,14 +4829,7 @@ async function run(hook, args) {
     for (const p of plugins) {
       const l = p && p.load;
       const f = l && typeof l === "object" ? l.filter : null;
-      let inc = f && f.id;
-      if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
-        inc = inc.include;
-      }
-      for (const r of Array.isArray(inc) ? inc : inc != null ? [inc] : []) {
-        if (r instanceof RegExp) pats.push(r.source);
-        else if (typeof r === "string") pats.push(r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-      }
+      if (f && f.id != null) pats.push(...(gatePatterns(f.id, "id") ?? [{ any: true }]));
     }
     return JSON.stringify(pats);
   }
@@ -4853,19 +4837,15 @@ async function run(hook, args) {
     // Object-form `resolveId` hooks' `filter.id` include patterns. Vite offers
     // every import (relative and absolute too) to plugin resolveId before its
     // own resolver; oj resolves natively first and routes a non-bare import
-    // through the plugins only when one of these patterns claims it.
+    // through the plugins only when one of these patterns claims it. A filter
+    // with no include (exclude-only) claims nothing, like a function-form
+    // hook: both stay plugin fallbacks for what oj cannot resolve, since
+    // claiming every import would route the whole graph through /@id/.
     const pats = [];
     for (const p of plugins) {
       const r = p && p.resolveId;
       const f = r && typeof r === "object" ? r.filter : null;
-      let inc = f && f.id;
-      if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
-        inc = inc.include;
-      }
-      for (const x of Array.isArray(inc) ? inc : inc != null ? [inc] : []) {
-        if (x instanceof RegExp) pats.push(x.source);
-        else if (typeof x === "string") pats.push(x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-      }
+      if (f && f.id != null) pats.push(...(gatePatterns(f.id, "id") ?? [{ any: true }]));
     }
     return JSON.stringify(pats);
   }

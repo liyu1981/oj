@@ -269,12 +269,14 @@ impl GlobCall {
 /// matches when an affirmed pattern does and no negated one does. `*` and
 /// `**` stop at a dot-led part the pattern does not spell, and a
 /// `node_modules` part below the pattern's scan base is ignored.
+#[derive(Debug)]
 pub struct GlobMatcher {
     affirmed: Vec<Affirmed>,
     negated: globset::GlobSet,
     exhaustive: bool,
 }
 
+#[derive(Debug)]
 struct Affirmed {
     glob: globset::GlobMatcher,
     /// pm.scan's base, unescaped: the literal directory the pattern starts in.
@@ -322,6 +324,29 @@ impl GlobMatcher {
         }
     }
 
+    /// Vite's pluginFilter matcher for a string `filter.id` already joined to
+    /// its cwd (`picomatch(glob, { dot: true })`): no `node_modules` ignore,
+    /// dot-led parts matched. None for what picomatch reads there and
+    /// globset cannot spell: an extglob (`@(..)`, `!(..)`, ...), a POSIX
+    /// class (`[[:alpha:]]`), a brace range (`{1..3}`), a `[!..]` class
+    /// (picomatch's set of `!` and the rest, globset's negation) or a leading
+    /// `!` (picomatch's `**` skips `.` parts there, so `./x.js` escapes it).
+    pub fn plugin_id_filter(glob: &str) -> Option<GlobMatcher> {
+        if ["@(", "!(", "+(", "?(", "*(", "[[:", "[!"]
+            .iter()
+            .any(|x| glob.contains(x))
+            || glob.starts_with('!')
+            || has_brace_range(glob)
+        {
+            return None;
+        }
+        Some(GlobMatcher::new(&GlobCall {
+            patterns: vec![glob.to_string()],
+            exhaustive: true,
+            case_sensitive: true,
+        }))
+    }
+
     /// Whether `file` (absolute, `/`-separated) is in the call's expansion.
     pub fn is_match(&self, file: &str) -> bool {
         let affirmed = self.affirmed.is_empty()
@@ -337,6 +362,13 @@ impl GlobMatcher {
             });
         affirmed && !self.negated.is_match(file)
     }
+}
+
+/// Whether a `{..}` group holds a `..` range, which picomatch expands.
+fn has_brace_range(glob: &str) -> bool {
+    glob.split('{')
+        .skip(1)
+        .any(|rest| rest.split('}').next().is_some_and(|g| g.contains("..")))
 }
 
 /// picomatch reads `[^...]` as a negated class, globset only `[!...]`.

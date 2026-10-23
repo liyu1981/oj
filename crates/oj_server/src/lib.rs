@@ -373,13 +373,13 @@ struct ServerState {
     plugins_have_resolve_id: bool,
     // A dep is transformed only when its source matches one of these (the plugins'
     // own transform `filter.code` patterns); app source always goes through.
-    dep_transform_res: Vec<regex::Regex>,
+    dep_transform_res: Vec<plugins::HookFilter>,
     // A dep goes through plugin `load` only when its path matches one of these
     // (the plugins' own object-form load `filter.id` patterns).
-    dep_load_res: Vec<regex::Regex>,
+    dep_load_res: Vec<plugins::HookFilter>,
     // A relative or absolute import is offered to plugin `resolveId` before oj's
     // resolver when it matches one of these (object-form resolveId `filter.id`).
-    resolve_id_res: Vec<regex::Regex>,
+    resolve_id_res: Vec<plugins::HookFilter>,
     plugins_watch_change: bool,
     /// A plugin hooks `transformIndexHtml`: dev pages run the host's transform,
     /// its hooks interleaved with Vite's; otherwise oj's native one (dev_html).
@@ -972,19 +972,12 @@ struct PluginCaps {
     have_transform: bool,
     have_load: bool,
     have_resolve_id: bool,
-    dep_transform_res: Vec<regex::Regex>,
-    dep_load_res: Vec<regex::Regex>,
-    resolve_id_res: Vec<regex::Regex>,
+    dep_transform_res: Vec<plugins::HookFilter>,
+    dep_load_res: Vec<plugins::HookFilter>,
+    resolve_id_res: Vec<plugins::HookFilter>,
     watch_change: bool,
     hot_update: bool,
     have_transform_index_html: bool,
-}
-
-fn compile_filters(patterns: &[String]) -> Vec<regex::Regex> {
-    patterns
-        .iter()
-        .filter_map(|s| regex::Regex::new(s).ok())
-        .collect()
 }
 
 impl PluginCaps {
@@ -993,9 +986,9 @@ impl PluginCaps {
         let have_transform = host.has_transform().await;
         let have_load = host.has_load().await;
         let have_resolve_id = host.has_resolve_id().await;
-        let dep_transform_res = compile_filters(&host.dep_transform_filters().await);
-        let dep_load_res = compile_filters(&host.dep_load_filters().await);
-        let resolve_id_res = compile_filters(&host.resolve_id_filters().await);
+        let dep_transform_res = host.dep_transform_filters().await;
+        let dep_load_res = host.dep_load_filters().await;
+        let resolve_id_res = host.resolve_id_filters().await;
         // Prime the per-plugin filter plan (hook_wants_* gates read it live): a filtered
         // hook's RPC is skipped for app modules its filter can never claim.
         let _ = host.build_hook_plan().await;
