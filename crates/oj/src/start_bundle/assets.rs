@@ -192,6 +192,10 @@ impl Styles {
         }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn inputs(&self) -> oj_server::StyleInputs<'_> {
         oj_server::StyleInputs {
             root: &self.root,
@@ -281,15 +285,21 @@ pub(crate) struct WorkerBundle {
     pub file_name: String,
 }
 
-/// Bundles a worker entry on its own (Vite's bundleWorkerEntry).
+/// Bundles a worker entry on its own (Vite's bundleWorkerEntry), given the
+/// entry and its bundle chain (the workers importing it, then the entry).
 pub(crate) type WorkerBundler = Arc<
     dyn Fn(
             PathBuf,
+            Vec<PathBuf>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<WorkerBundle, String>> + Send>,
         > + Send
         + Sync,
 >;
+
+/// Worker bundles in flight by entry and asking chain, each shared by the
+/// loads that wait on it.
+type WorkerBundling = HashMap<(PathBuf, Vec<PathBuf>), Arc<tokio::sync::OnceCell<WorkerBundle>>>;
 
 /// The build's content-hash emitter: every asset, stylesheet and worker the
 /// client, server and worker bundles import is written once into
@@ -306,8 +316,14 @@ pub(crate) struct Emitter {
     worker_bundler: Mutex<Option<WorkerBundler>>,
     /// `worker.format` is "es": workers start as modules, not classic scripts.
     worker_module: std::sync::atomic::AtomicBool,
-    worker_codes: Mutex<HashMap<PathBuf, Arc<tokio::sync::OnceCell<WorkerBundle>>>>,
-    worker_urls: Mutex<HashMap<PathBuf, Arc<tokio::sync::OnceCell<String>>>>,
+    /// Finished worker bundles, by entry (Vite's worker output cache).
+    worker_codes: Mutex<HashMap<PathBuf, WorkerBundle>>,
+    /// Bundles in flight, by entry and the chain that asked: as in Vite, an
+    /// unfinished bundle is never shared with another chain, which could be
+    /// the one it waits on (a cycle between two workers the client imports).
+    worker_bundling: Mutex<WorkerBundling>,
+    /// Worker entries written to the output.
+    worker_files: Mutex<std::collections::HashSet<String>>,
     /// The first worker bundle that failed: the parent bundle reports it as a
     /// failed load of the worker, and the worker's own error is what Vite shows.
     worker_error: Mutex<Option<String>>,
@@ -325,7 +341,8 @@ impl Emitter {
             worker_bundler: Mutex::new(None),
             worker_module: std::sync::atomic::AtomicBool::new(false),
             worker_codes: Mutex::new(HashMap::new()),
-            worker_urls: Mutex::new(HashMap::new()),
+            worker_bundling: Mutex::new(HashMap::new()),
+            worker_files: Mutex::new(Default::default()),
             worker_error: Mutex::new(None),
         }
     }
@@ -376,6 +393,19 @@ impl Emitter {
             std::fs::write(self.assets_dir.join(&name), bytes).map_err(|e| e.to_string())?;
         }
         Ok(format!("{}assets/{name}", self.base))
+    }
+
+    /// CSS a worker bundle's plugins routed through its `vite:css-post`:
+    /// emitted beside the worker as Vite's worker build emits its chunk's
+    /// sheet, minified under cssMinify, linked from nowhere.
+    pub fn worker_css(&self, entry: &Path, css: &str) -> Result<String, String> {
+        let path = entry.with_extension("css");
+        let css = if self.styles.minify_client {
+            format!("{}\n", self.styles.minify(&path, css)?)
+        } else {
+            css.to_string()
+        };
+        self.write(&path, css.as_bytes())
     }
 
     /// Emits the file at `path`: a stylesheet compiled with its `url()`s
@@ -499,13 +529,47 @@ impl Emitter {
         Ok(out)
     }
 
-    /// A worker entry's bundle, bundled once per file.
-    pub async fn worker_code(&self, path: &Path) -> Result<WorkerBundle, String> {
+    /// `chain` (the workers whose bundles import `path`, empty from the
+    /// client or server) with `path` last; a worker importing itself through
+    /// them fails, as in Vite, before it could wait on its own bundle.
+    fn worker_chain(&self, path: &Path, chain: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+        let mut new_chain = chain.to_vec();
+        new_chain.push(path.to_path_buf());
+        if !chain.iter().any(|p| p == path) {
+            return Ok(new_chain);
+        }
+        let root = self.styles.root();
+        let names: Vec<String> = new_chain
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        Err(format!(
+            "Circular worker imports detected. Vite does not support it. Import chain: {}",
+            names.join(" -> ")
+        ))
+    }
+
+    /// A worker entry's bundle under `chain`: a finished one is reused, as
+    /// Vite's worker output cache is.
+    pub async fn worker_code(
+        &self,
+        path: &Path,
+        chain: &[PathBuf],
+    ) -> Result<WorkerBundle, String> {
+        let new_chain = self.worker_chain(path, chain)?;
+        if let Some(done) = self.worker_codes.lock().unwrap().get(path) {
+            return Ok(done.clone());
+        }
         let cell = Arc::clone(
-            self.worker_codes
+            self.worker_bundling
                 .lock()
                 .unwrap()
-                .entry(path.to_path_buf())
+                .entry((path.to_path_buf(), chain.to_vec()))
                 .or_default(),
         );
         let bundler = self.worker_bundler.lock().unwrap().clone();
@@ -513,10 +577,17 @@ impl Emitter {
             .get_or_try_init(|| async move {
                 let bundler = bundler
                     .ok_or_else(|| format!("oj: no worker bundler for {}", path.display()))?;
-                bundler(path.to_path_buf()).await
+                bundler(path.to_path_buf(), new_chain).await
             })
             .await
             .cloned();
+        if let Ok(done) = &result {
+            self.worker_codes
+                .lock()
+                .unwrap()
+                .entry(path.to_path_buf())
+                .or_insert_with(|| done.clone());
+        }
         if let Err(e) = &result {
             self.worker_error
                 .lock()
@@ -527,26 +598,22 @@ impl Emitter {
     }
 
     /// The emitted URL of a worker entry's bundle.
-    pub async fn worker(&self, path: &Path) -> Result<String, String> {
-        let cell = Arc::clone(
-            self.worker_urls
-                .lock()
-                .unwrap()
-                .entry(path.to_path_buf())
-                .or_default(),
-        );
-        cell.get_or_try_init(|| async move {
-            let bundle = self.worker_code(path).await?;
+    pub async fn worker(&self, path: &Path, chain: &[PathBuf]) -> Result<String, String> {
+        let bundle = self.worker_code(path, chain).await?;
+        if self
+            .worker_files
+            .lock()
+            .unwrap()
+            .insert(bundle.file_name.clone())
+        {
             let assets = self.assets_dir.parent().unwrap_or(&self.assets_dir);
             let dest = assets.join(&bundle.file_name);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             std::fs::write(&dest, bundle.code.as_bytes()).map_err(|e| e.to_string())?;
-            Ok(format!("{}{}", self.base, bundle.file_name))
-        })
-        .await
-        .cloned()
+        }
+        Ok(format!("{}{}", self.base, bundle.file_name))
     }
 }
 
@@ -725,7 +792,13 @@ pub(crate) enum AssetMode {
     },
     /// The build's emitter; `server` for the server bundle (which links no
     /// stylesheet and minifies `?inline` sheets under ssr's cssMinify).
-    Build { emitter: Arc<Emitter>, server: bool },
+    /// `worker_chain` is a worker bundle's chain (empty for the client and
+    /// server), the workers it imports bundling under it.
+    Build {
+        emitter: Arc<Emitter>,
+        server: bool,
+        worker_chain: Vec<PathBuf>,
+    },
 }
 
 pub(crate) const DEV_FS_BASE: &str = "/@oj-start/fs";
@@ -768,7 +841,11 @@ impl StartAssetsPlugin {
                 Ok(rel) => format!("{url_base}/{}", rel.to_string_lossy().replace('\\', "/")),
                 Err(_) => format!("{url_base}/@fs{}", path.display()),
             }),
-            AssetMode::Build { emitter, .. } => emitter.worker(path).await,
+            AssetMode::Build {
+                emitter,
+                worker_chain,
+                ..
+            } => emitter.worker(path, worker_chain).await,
         }
     }
 
@@ -800,7 +877,9 @@ impl StartAssetsPlugin {
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     self.styles.dev_inline(path).await?
                 }
-                AssetMode::Build { emitter, server } => {
+                AssetMode::Build {
+                    emitter, server, ..
+                } => {
                     let compiled = self.styles.compile(path).await?;
                     // A build gives a CSS module's class map even inlined.
                     if is_css_module(&path_str) {
@@ -818,18 +897,40 @@ impl StartAssetsPlugin {
                     AssetMode::Dev { .. } => true,
                     AssetMode::Build { emitter, .. } => emitter.worker_is_module(),
                 };
+                // Vite's vite:worker: a worker importing its own entry starts
+                // itself again, at its own URL.
+                let own = matches!(
+                    &self.mode,
+                    AssetMode::Build { worker_chain, .. } if worker_chain.last().is_some_and(|p| p == path)
+                );
                 match (form, &self.mode) {
-                    (WorkerForm::Inline, AssetMode::Build { emitter, .. }) => {
-                        inline_worker_module(shared, &emitter.worker_code(path).await?.code, module)
-                    }
-                    (WorkerForm::Url, _) => {
-                        format!("export default {};", json(&self.worker_url_for(path).await?))
-                    }
-                    _ => format!(
-                        "export default function WorkerWrapper(options) {{ return new {ctor}({}, {}); }}",
-                        json(&self.worker_url_for(path).await?),
-                        worker_type_option(module)
+                    (
+                        WorkerForm::Inline,
+                        AssetMode::Build {
+                            emitter,
+                            worker_chain,
+                            ..
+                        },
+                    ) if !own => inline_worker_module(
+                        shared,
+                        &emitter.worker_code(path, worker_chain).await?.code,
+                        module,
                     ),
+                    _ => {
+                        let url = if own {
+                            "self.location.href".to_string()
+                        } else {
+                            json(&self.worker_url_for(path).await?)
+                        };
+                        if matches!(form, WorkerForm::Url) {
+                            format!("export default {url};")
+                        } else {
+                            format!(
+                                "export default function WorkerWrapper(options) {{ return new {ctor}({url}, {}); }}",
+                                worker_type_option(module)
+                            )
+                        }
+                    }
                 }
             }
             AssetTag::Css => {
@@ -857,6 +958,7 @@ impl StartAssetsPlugin {
                     AssetMode::Build {
                         emitter,
                         server: false,
+                        ..
                     } => match &compiled {
                         Some(c) => {
                             emitter.css(path, c.css.clone()).await?;

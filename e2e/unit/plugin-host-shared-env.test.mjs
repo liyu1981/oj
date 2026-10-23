@@ -256,10 +256,12 @@ test("buildApp runs the hooks around oj's environment builds", async () => {
 
 // Vite's bundleWorkerEntry: a worker bundle's plugins are `worker.plugins`
 // alone (the option called for a fresh set), its resolved config `isWorker`
-// with the bundle chain; the app's own plugins are not there.
+// with the bundle chain; the app's own plugins are not there. The worker's
+// container lives in the app's realm, so the two sets share module state as
+// they do under Vite, and a closed container answers no more hooks.
 const viteSrc = path.join(repo, "e2e/fixtures/start-app/node_modules/vite");
 test(
-  "a worker bundle host runs worker.plugins alone",
+  "a worker bundle's container runs worker.plugins alone, beside the app's",
   { skip: !fs.existsSync(viteSrc) && "fixture vite not installed" },
   async () => {
     const fx = tmpProject({ prefix: "oj-worker-host-" });
@@ -268,15 +270,20 @@ test(
       "vite.config.mjs",
       `${LOG}
      let calls = 0;
+     const shared = [];
      export default {
-       plugins: [{ name: "app", buildStart() { log("app buildStart"); } }],
+       plugins: [{
+         name: "app",
+         buildStart() { log("app buildStart " + this.environment.name); },
+         closeBundle() { log("app closeBundle shared=" + shared.join(",")); },
+       }],
        worker: {
          plugins: () => {
            calls++;
            return [[{
              name: "worker",
              configResolved(c) { log("worker configResolved isWorker=" + c.isWorker + " chain=" + c.bundleChain.join(",") + " calls=" + calls); },
-             buildStart() { log("worker buildStart " + this.environment.name); },
+             buildStart() { log("worker buildStart " + this.environment.name); shared.push("worker-" + calls); },
            }]];
          },
        },
@@ -292,19 +299,152 @@ test(
           environment: { name: "client", mode: "build" },
           ojStartMode: true,
           ojBundleHost: true,
-          ojWorkerBundle: { chain: ["/app/src/w.ts"] },
+        }),
+      ],
+      env: { OJ_CACHE_ROOT: fx.root },
+      cwd: fx.root,
+    });
+    const call = async (id, hook, args, container) => {
+      const r = await host.send({ id, hook, args, container });
+      assert.equal(r.error, undefined, `${hook}: ${r.error}\n${host.stderr()}`);
+      return r.result;
+    };
+    try {
+      await host.initSignal();
+      const worker = Number(await call(1, "openWorkerContainer", [JSON.stringify(["/app/src/w.ts"])]));
+      assert.ok(worker > 0, `a worker container id: ${worker}`);
+      await call(2, "buildStart", [], worker);
+      await call(3, "closeBundle", [], worker);
+      await call(4, "closeContainer", [], worker);
+      await call(5, "buildStart", []);
+      await call(6, "closeBundle", []);
+      assert.deepEqual(events(fx), [
+        "worker configResolved isWorker=true chain=/app/src/w.ts calls=1",
+        "worker buildStart client",
+        "app buildStart client",
+        "app closeBundle shared=worker-1",
+      ]);
+      const closed = await host.send({ id: 7, hook: "buildStart", args: [], container: worker });
+      assert.match(String(closed.error), /container \d+ is closed/, JSON.stringify(closed));
+    } finally {
+      host.close();
+      fx.cleanup();
+    }
+  },
+);
+
+// A worker plugin whose config hook fails is skipped in a Start build, but
+// that never excuses the app's own plugins: their buildApp failure still
+// fails the build.
+test(
+  "a worker's skipped config hook leaves the app's buildApp failure fatal",
+  { skip: !fs.existsSync(viteSrc) && "fixture vite not installed" },
+  async () => {
+    const fx = tmpProject({ prefix: "oj-worker-skip-" });
+    fx.write(
+      "vite.config.mjs",
+      `export default {
+         plugins: [{ name: "app", buildApp: { order: "post", handler() { throw new Error("app refused"); } } }],
+         worker: { plugins: () => [{ name: "worker", config() { throw new Error("worker config broke"); } }] },
+       };\n`,
+    );
+    const host = rpcSidecar("plugin-host.mjs", {
+      args: [
+        path.join(fx.root, "vite.config.mjs"),
+        JSON.stringify({
+          pluginsFormat: "vite",
+          config: { root: fx.root, base: "/", mode: "production", command: "build" },
+          env: { command: "build", mode: "production" },
+          environment: { name: "client", mode: "build" },
+          ojStartMode: true,
+          ojBundleHost: true,
         }),
       ],
       env: { OJ_CACHE_ROOT: fx.root },
       cwd: fx.root,
     });
     try {
-      const r = await host.send({ id: 1, hook: "buildStart", args: [] });
-      assert.equal(r.error, undefined, `${r.error}\n${host.stderr()}`);
-      assert.deepEqual(events(fx), [
-        "worker configResolved isWorker=true chain=/app/src/w.ts calls=1",
-        "worker buildStart client",
+      await host.initSignal();
+      const opened = await host.send({ id: 1, hook: "openWorkerContainer", args: [JSON.stringify(["/app/src/w.ts"])] });
+      assert.equal(opened.error, undefined, JSON.stringify(opened));
+      const built = JSON.stringify({ client: { outDir: "/out/client", input: "c.tsx" } });
+      host.child.stdin.write(JSON.stringify({ id: 2, hook: "buildApp", args: [built] }) + "\n");
+      const request = await host.nextFrame();
+      assert.equal(request.method, "buildEnvironments", JSON.stringify(request));
+      const reply = await host
+        .send({ id: 3, hook: "rpcReply", args: [String(request.rpc), JSON.stringify({ result: null })] })
+        .then(async (r) => (r.id === 2 ? r : host.nextFrame()));
+      assert.match(String(reply.error), /\[plugin:app\] app refused/, JSON.stringify(reply));
+    } finally {
+      host.close();
+      fx.cleanup();
+    }
+  },
+);
+
+// Each Vite environment resolves its own `vite:css-post`: CSS a worker
+// plugin routes through it ships with the worker, not the app's stylesheet.
+// The worker's own natively run plugins stay listed and drive its facts.
+test(
+  "a worker container's css-post and plugin list are its own",
+  { skip: !fs.existsSync(viteSrc) && "fixture vite not installed" },
+  async () => {
+    const fx = tmpProject({ prefix: "oj-worker-css-" });
+    // Each plugin hands CSS to the css-post its resolved config lists.
+    fx.write(
+      "vite.config.mjs",
+      `import { appendFileSync } from "node:fs";
+       const routes = (name) => {
+         let resolved;
+         return {
+           name,
+           configResolved(c) { resolved = c; },
+           buildStart() {
+             const post = resolved.plugins.find((p) => p.name === "vite:css-post");
+             post.transform.handler("." + name + "{}", "/" + name + ".css");
+             const listed = resolved.plugins.some((p) => p.name === "vite:react-refresh");
+             appendFileSync(new URL("./events.log", import.meta.url), name + " lists react-refresh=" + listed + "\\n");
+           },
+         };
+       };
+       const refresh = { name: "vite:react-refresh" };
+       export default {
+         plugins: [routes("app")],
+         worker: { plugins: () => [routes("worker"), refresh] },
+       };\n`,
+    );
+    const host = rpcSidecar("plugin-host.mjs", {
+      args: [
+        path.join(fx.root, "vite.config.mjs"),
+        JSON.stringify({
+          pluginsFormat: "vite",
+          config: { root: fx.root, base: "/", mode: "production", command: "build" },
+          env: { command: "build", mode: "production" },
+          environment: { name: "client", mode: "build" },
+          ojStartMode: true,
+          ojBundleHost: true,
+        }),
+      ],
+      env: { OJ_CACHE_ROOT: fx.root },
+      cwd: fx.root,
+    });
+    const call = async (id, hook, args, container) => {
+      const r = await host.send({ id, hook, args, container });
+      assert.equal(r.error, undefined, `${hook}: ${r.error}\n${host.stderr()}`);
+      return r.result;
+    };
+    try {
+      await host.initSignal();
+      const worker = Number(await call(1, "openWorkerContainer", [JSON.stringify(["/app/src/w.ts"])]));
+      await call(2, "buildStart", [], worker);
+      await call(3, "buildStart", []);
+      assert.deepEqual(JSON.parse(await call(4, "getPluginCss", [])), [{ id: "/app.css", css: ".app{}" }]);
+      assert.deepEqual(JSON.parse(await call(5, "getPluginCss", [], worker)), [
+        { id: "/worker.css", css: ".worker{}" },
       ]);
+      assert.deepEqual(events(fx), ["worker lists react-refresh=true", "app lists react-refresh=false"]);
+      assert.equal(JSON.parse(await call(6, "startFacts", [], worker)).reactRefresh, true);
+      assert.equal(JSON.parse(await call(7, "startFacts", [])).reactRefresh, false);
     } finally {
       host.close();
       fx.cleanup();

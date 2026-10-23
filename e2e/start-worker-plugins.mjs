@@ -8,8 +8,12 @@
 // lifecycle: buildStart, resolveId/load, moduleParsed (lowered JS),
 // generateBundle over the worker's output (what it emits ships with the
 // client, a chunk it rewrites ships rewritten), closeBundle. The app's own
-// plugins never see a worker's modules. oj ran the app plugins in the worker
-// bundle without their lifecycle and ignored `worker.plugins`.
+// plugins never see a worker's modules, but share module state with the
+// worker's: under Vite both sets live in one process, so a config-level
+// collector the worker plugins fill is what the app's plugins read at
+// closeBundle. oj ran the app plugins in the worker bundle without their
+// lifecycle and ignored `worker.plugins`, then ran the worker plugins on a
+// host of their own, a separate realm whose state the app never saw.
 //
 // The bundle also follows `worker.format` and `worker.rolldownOptions`. The
 // default format is iife: the worker inlines its dynamic imports, starts as a
@@ -53,6 +57,7 @@ const write = (rel, text) => {
 };
 const report = path.join(app, "worker-seen.json");
 const appSeen = path.join(app, "app-seen.json");
+const chains = path.join(app, "worker-chains.log");
 
 write("src/lib/wk/helper.ts", "export const n: number = 41;\n");
 write("src/lib/wk/lazy.ts", 'export const lazy: string = "lazy-ok";\n');
@@ -75,9 +80,11 @@ const configPath = path.join(app, "vite.config.ts");
 let config = fs.readFileSync(configPath, "utf8");
 config = config.replace(
   "export default defineConfig({",
-  `import { writeFileSync } from "node:fs";
+  `import { appendFileSync, writeFileSync } from "node:fs";
 
 let workerPluginCalls = 0;
+// Filled by the worker plugins, read by the app's: one realm, as in Vite.
+const sharedWithApp: string[] = [];
 function workerPlugins() {
   workerPluginCalls++;
   const seen: Record<string, string[]> = {};
@@ -89,6 +96,7 @@ function workerPlugins() {
         add("config", env.command);
       },
       configResolved(this: any, resolved: any) {
+        appendFileSync(${JSON.stringify(chains)}, resolved.bundleChain.map((f: string) => f.split("/").pop()).join(">") + "\\n");
         add("configResolved", [resolved.isWorker, resolved.bundleChain?.some((f: string) => f.endsWith("/wk/worker.ts")), !!this.meta?.rolldownVersion].join(","));
       },
       buildStart() {
@@ -102,7 +110,10 @@ function workerPlugins() {
       },
       moduleParsed(info: any) {
         const name = info.id.split("/").pop();
-        if (/^(worker|helper)\\.ts$/.test(name)) add("moduleParsed", name + ":" + !info.code.includes(": number"));
+        if (/^(worker|helper)\\.ts$/.test(name)) {
+          add("moduleParsed", name + ":" + !info.code.includes(": number"));
+          sharedWithApp.push(name);
+        }
       },
       generateBundle(_o: any, bundle: any) {
         for (const o of Object.values(bundle) as any[]) {
@@ -113,6 +124,7 @@ function workerPlugins() {
         this.emitFile({ type: "asset", fileName: "worker-plugin.txt", source: "emitted" });
       },
       closeBundle() {
+        if (process.env.OJ_E2E_WORKER_CLOSE_THROWS) throw new Error("worker closeBundle threw");
         add("closeBundle", "ran");
         writeFileSync(${JSON.stringify(report)}, JSON.stringify({ calls: workerPluginCalls, ...seen }));
       },
@@ -134,7 +146,7 @@ function appWatcher() {
       if (info.id.includes("/wk/") && !info.id.includes("?worker")) seen.push("moduleParsed " + info.id);
     },
     closeBundle() {
-      writeFileSync(${JSON.stringify(appSeen)}, JSON.stringify(seen));
+      writeFileSync(${JSON.stringify(appSeen)}, JSON.stringify({ seen, shared: [...sharedWithApp].sort() }));
     },
   };
 }
@@ -155,12 +167,12 @@ const must = (cond, msg) => {
 
 const out = path.join(app, "dist");
 const client = path.join(out, "client");
-const buildWith = (format) => {
+const buildWith = (format, env = {}) => {
   try {
     return execSync(`${JSON.stringify(oj)} build ${JSON.stringify(app)} --out ${JSON.stringify(out)} 2>&1`, {
       cwd: repo,
       encoding: "utf8",
-      env: { ...process.env, OJ_E2E_WORKER_FORMAT: format ?? "" },
+      env: { ...process.env, OJ_E2E_WORKER_FORMAT: format ?? "", ...env },
     });
   } catch (e) {
     throw new Error(`oj build (worker format ${format ?? "default"}) failed:\n${e.stdout ?? ""}${e.stderr ?? ""}`);
@@ -199,7 +211,11 @@ try {
   );
 
   const appHooks = JSON.parse(fs.readFileSync(appSeen, "utf8"));
-  must(appHooks.length === 0, `the app's plugins saw the worker's modules: ${JSON.stringify(appHooks)}`);
+  must(appHooks.seen.length === 0, `the app's plugins saw the worker's modules: ${JSON.stringify(appHooks.seen)}`);
+  must(
+    JSON.stringify(appHooks.shared) === JSON.stringify(["helper.ts", "worker.ts"]),
+    `the app's plugins do not share the worker plugins' module state: ${JSON.stringify(appHooks.shared)}`,
+  );
 
   must(
     fs.existsSync(path.join(client, "worker-plugin.txt")),
@@ -235,15 +251,73 @@ try {
   // `virtual:build-info`) does not resolve inside a worker: the build fails
   // naming it. The plugin belongs in `worker.plugins` too.
   const workerFile = path.join(app, "src/lib/wk/worker.ts");
+  const workerSource = fs.readFileSync(workerFile, "utf8");
+
+  // A worker's own `?worker` imports bundle under its chain: the nested
+  // worker's plugins see [outer, inner], as Vite's bundleChain.
+  write("src/lib/wk/inner.ts", "self.onmessage = () => self.postMessage(1);\n");
   fs.writeFileSync(
     workerFile,
-    'import { buildTag } from "virtual:build-info";\n' +
-      fs.readFileSync(workerFile, "utf8") +
-      "console.log(buildTag);\n",
+    'import innerUrl from "./inner.ts?worker&url";\nconsole.log(innerUrl);\n' + workerSource,
   );
-  let failure = null;
+  fs.rmSync(chains, { force: true });
+  buildWith(undefined);
+  const seenChains = fs.readFileSync(chains, "utf8").trim().split("\n").sort();
+  must(
+    JSON.stringify(seenChains) === JSON.stringify(["worker.ts", "worker.ts>inner.ts"]),
+    `the nested worker's bundle chain is not [outer, inner]: ${JSON.stringify(seenChains)}`,
+  );
+
+  // A worker importing its own entry starts itself again at its own URL
+  // (Vite's vite:worker), no second bundle.
+  fs.writeFileSync(
+    workerFile,
+    'import selfUrl from "./worker.ts?worker&url";\nconsole.log("self:" + selfUrl);\n' + workerSource,
+  );
+  buildWith(undefined);
+  assets = fs.readdirSync(path.join(client, "assets"));
+  code = fs.readFileSync(
+    path.join(
+      client,
+      "assets",
+      assets.find((f) => /^wk-worker-.*\.js$/.test(f)),
+    ),
+    "utf8",
+  );
+  must(code.includes("self:"), "the worker's self import is not in its bundle");
+  must(!code.includes("/assets/wk-worker-"), "a worker importing itself bundled itself again");
+
+  // Through another worker it is a cycle: the build fails naming the chain.
+  fs.writeFileSync(
+    path.join(app, "src/lib/wk/inner.ts"),
+    'import back from "./worker.ts?worker&url";\nconsole.log(back);\n',
+  );
+  fs.writeFileSync(
+    workerFile,
+    'import innerUrl from "./inner.ts?worker&url";\nconsole.log(innerUrl);\n' + workerSource,
+  );
+  let circular = null;
   try {
     buildWith(undefined);
+  } catch (e) {
+    circular = e.message;
+  }
+  must(circular, "a worker cycle built; Vite fails on circular worker imports");
+  must(
+    circular.includes(
+      "Circular worker imports detected. Vite does not support it. Import chain: src/lib/wk/worker.ts -> src/lib/wk/inner.ts -> src/lib/wk/worker.ts",
+    ),
+    `the failure does not name the circular worker chain:\n${circular}`,
+  );
+
+  fs.writeFileSync(
+    workerFile,
+    'import { buildTag } from "virtual:build-info";\n' + workerSource + "console.log(buildTag);\n",
+  );
+  // A worker plugin's closeBundle failing too does not hide why the bundle failed.
+  let failure = null;
+  try {
+    buildWith(undefined, { OJ_E2E_WORKER_CLOSE_THROWS: "1" });
   } catch (e) {
     failure = e.message;
   }
