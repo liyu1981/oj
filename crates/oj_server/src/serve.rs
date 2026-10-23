@@ -44,7 +44,12 @@ async fn serve_internal_route(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Option<Response> {
+    // `base` is already stripped (base_middleware); the StyleX runtime's
+    // unprefixed fetch of its sheet passes through it as is.
     let path = uri.path();
+    if let Some(resp) = crate::stylex::serve_route(state, path) {
+        return Some(resp);
+    }
     if let Some(name) = path.strip_prefix("/@oj-deps/") {
         if name.contains('/') || name.contains("..") {
             return Some((StatusCode::FORBIDDEN, "oj: bad optimized dep path").into_response());
@@ -128,6 +133,21 @@ async fn serve_internal_route(
         };
         if is_html_proxy(&spec) {
             return Some(serve_html_proxy(state, headers, &spec, &id_path).await);
+        }
+        if let Some(source) = crate::stylex::virtual_module(state, &spec) {
+            // Compiled like any module: the runtime reads `import.meta.hot`.
+            let file = state.root.join("__oj_stylex_virtual.js");
+            return Some(
+                serve_compiled_from(
+                    state,
+                    &file,
+                    &id_path,
+                    None,
+                    headers,
+                    Some(source.to_string()),
+                )
+                .await,
+            );
         }
         return Some(serve_plugin_id(state, &spec, &importer).await);
     }

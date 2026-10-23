@@ -52,6 +52,7 @@ mod preprocessors_build;
 mod rolldown_options;
 mod root_absolute_imports_build;
 mod ssr_options;
+mod stylex_build;
 mod svelte_build;
 mod svgr_build;
 mod vite_build_manifest_in_bundle;

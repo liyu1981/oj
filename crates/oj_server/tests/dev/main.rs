@@ -72,6 +72,7 @@ mod preprocessors;
 mod query_assets;
 mod redirect_passthrough;
 mod resolve_created_files;
+mod stylex;
 mod svelte;
 mod svgr;
 mod tailwind_js_import;

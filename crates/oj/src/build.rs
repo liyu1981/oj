@@ -3109,6 +3109,11 @@ pub async fn build(root: PathBuf, cli_mode: Option<&str>, cli: CliOptions) -> an
     let env_delta = plugin_env_delta(&plugin_host).await;
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    let stylex =
+        oj_server::stylex::plugin_for(&root, &config, "build").map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(plugin) = &stylex {
+        oj_plugins.push(crate::stylex_plugin::transform(plugin));
+    }
     if let Some(host) = &plugin_host {
         oj_plugins.push(Pluginable::new_shared(OjUserPlugin::new(
             Arc::clone(host),
@@ -3367,6 +3372,11 @@ pub async fn build(root: PathBuf, cli_mode: Option<&str>, cli: CliOptions) -> an
         }
     }
 
+    // The StyleX plugin's sheet joins the first stylesheet the build emits.
+    let mut stylex_css = match &stylex {
+        Some(plugin) => crate::stylex_plugin::stylesheet(plugin, &root)?,
+        None => None,
+    };
     // Non-split CSS is one combined stylesheet linked from every page.
     let combined_css_name: Option<String> = if !css_split {
         let mut css_entries = collected_css.lock().unwrap().clone();
@@ -3396,6 +3406,7 @@ pub async fn build(root: PathBuf, cli_mode: Option<&str>, cli: CliOptions) -> an
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let combined = append_stylex(combined, stylex_css.take());
             let hash = content_hash(combined.as_bytes());
             let css_name = render_asset_name(css_asset_opts.asset_names, "style", &hash, "css");
             if let Some(parent) = out_dir.join(&css_name).parent() {
@@ -3430,10 +3441,12 @@ pub async fn build(root: PathBuf, cli_mode: Option<&str>, cli: CliOptions) -> an
             &mut emitted,
             &mut manifest_entries,
             &mut manifest_assets,
+            &mut stylex_css,
         )?
     } else {
         Vec::new()
     };
+    write_stylex_fallback(&out_dir, stylex_css, &mut emitted)?;
     let mut all_sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if let Some(name) = oj_config::ssr_manifest_name(&config) {
         let manifest = ssr_manifest(
@@ -4390,6 +4403,11 @@ pub(crate) async fn build_ssr(
 
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    let stylex =
+        oj_server::stylex::plugin_for(root, config, "build").map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(plugin) = &stylex {
+        oj_plugins.push(crate::stylex_plugin::transform(plugin));
+    }
     if let Some(host) = &plugin_host {
         oj_plugins.push(Pluginable::new_shared(OjUserPlugin::new(
             Arc::clone(host),
@@ -4489,6 +4507,12 @@ pub(crate) async fn build_ssr(
         if let rolldown_common::Output::Chunk(c) = asset {
             emitted.push((c.filename.to_string(), c.code.len()));
         }
+    }
+    // An SSR build emits no stylesheet, so the StyleX plugin's sheet takes
+    // its writeBundle fallback there too.
+    if let Some(plugin) = &stylex {
+        let sheet = crate::stylex_plugin::stylesheet(plugin, root)?;
+        write_stylex_fallback(out_dir, sheet, &mut emitted)?;
     }
     println!(
         "oj build (ssr): {} in {:?}",
@@ -4971,6 +4995,11 @@ async fn build_client_entry(
     let env_delta = plugin_env_delta(&plugin_host).await;
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    let stylex =
+        oj_server::stylex::plugin_for(root, config, "build").map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(plugin) = &stylex {
+        oj_plugins.push(crate::stylex_plugin::transform(plugin));
+    }
     if let Some(host) = &plugin_host {
         oj_plugins.push(Pluginable::new_shared(OjUserPlugin::new(
             Arc::clone(host),
@@ -5065,7 +5094,11 @@ async fn build_client_entry(
     let js = js.ok_or_else(|| anyhow::anyhow!("client build produced no entry chunk"))?;
 
     let mut css_entries = collected_css.lock().unwrap().clone();
-    let css = if css_entries.is_empty() {
+    let stylex_css = match &stylex {
+        Some(plugin) => crate::stylex_plugin::stylesheet(plugin, root)?,
+        None => None,
+    };
+    let css = if css_entries.is_empty() && stylex_css.is_none() {
         None
     } else {
         css_entries.sort();
@@ -5074,6 +5107,7 @@ async fn build_client_entry(
             .map(|(_, css)| css)
             .collect::<Vec<_>>()
             .join("\n");
+        let combined = append_stylex(combined, stylex_css);
         let hash = format!("{:016x}", {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -5207,6 +5241,10 @@ async fn build_library(
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut emitted: Vec<(String, usize)> = Vec::new();
+    // The StyleX plugin, one instance across the formats: each records the
+    // same modules' rules again.
+    let stylex =
+        oj_server::stylex::plugin_for(root, config, "build").map_err(|e| anyhow::anyhow!(e))?;
 
     for fmt in &formats {
         let format = match fmt.as_str() {
@@ -5238,24 +5276,29 @@ async fn build_library(
             rolldown_minify(minify)
         };
 
+        let mut plugins: Vec<SharedPluginable> = Vec::new();
+        if let Some(plugin) = &stylex {
+            plugins.push(crate::stylex_plugin::transform(plugin));
+        }
+        plugins.push(Pluginable::new_shared(OjCssPlugin {
+            collected: Arc::clone(&collected_css),
+            root: root.to_path_buf(),
+            has_postcss: oj_server::has_postcss_config(root),
+            // Vite inlines every asset of a library build.
+            inline_limit: u64::MAX,
+            client: true,
+            resolve: css_resolve_of(root, config, "client", is_production),
+            base: normalize_base(config.base.as_deref().unwrap_or("/")),
+            css_code_split: false,
+            host: None,
+            css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+            css: config.css.clone(),
+            html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            worker: None,
+            worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        }));
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Pluginable::new_shared(OjCssPlugin {
-                collected: Arc::clone(&collected_css),
-                root: root.to_path_buf(),
-                has_postcss: oj_server::has_postcss_config(root),
-                // Vite inlines every asset of a library build.
-                inline_limit: u64::MAX,
-                client: true,
-                resolve: css_resolve_of(root, config, "client", is_production),
-                base: normalize_base(config.base.as_deref().unwrap_or("/")),
-                css_code_split: false,
-                host: None,
-                css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
-                css: config.css.clone(),
-                html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
-                worker: None,
-                worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            })])
+            .with_plugins(plugins)
             .with_options(BundlerOptions {
                 input: Some(
                     entries
@@ -5307,12 +5350,17 @@ async fn build_library(
     }
 
     let css_entries = collected_css.lock().unwrap().clone();
+    let mut stylex_css = match &stylex {
+        Some(plugin) => crate::stylex_plugin::stylesheet(plugin, root)?,
+        None => None,
+    };
     if !css_entries.is_empty() {
         let combined: String = css_entries
             .into_iter()
             .map(|(_, css)| css)
             .collect::<Vec<_>>()
             .join("\n");
+        let combined = append_stylex(combined, stylex_css.take());
         // Vite: `build.lib.cssFileName`, else the library's file name / package name.
         let css_stem = lib
             .css_file_name
@@ -5324,6 +5372,7 @@ async fn build_library(
         fs::write(out_dir.join(&css_name), &combined)?;
         emitted.push((css_name, combined.len()));
     }
+    write_stylex_fallback(out_dir, stylex_css, &mut emitted)?;
 
     println!(
         "oj build (library): {} in {:?}",
@@ -5514,6 +5563,32 @@ fn preload_deps(
     out
 }
 
+/// `@stylexjs/unplugin`'s generateBundle: its sheet appended to a stylesheet
+/// the build emits, before that file is hashed.
+fn append_stylex(css: String, stylex: Option<String>) -> String {
+    match stylex {
+        Some(sheet) if css.is_empty() => sheet,
+        Some(sheet) => format!("{css}\n{sheet}"),
+        None => css,
+    }
+}
+
+/// The plugin's writeBundle fallback for a build with no stylesheet:
+/// `assets/stylex.css` in the output, linked from nowhere.
+fn write_stylex_fallback(
+    out_dir: &Path,
+    stylex: Option<String>,
+    emitted: &mut Vec<(String, usize)>,
+) -> anyhow::Result<()> {
+    let Some(sheet) = stylex else {
+        return Ok(());
+    };
+    fs::create_dir_all(out_dir.join("assets"))?;
+    fs::write(out_dir.join("assets/stylex.css"), &sheet)?;
+    emitted.push(("assets/stylex.css".to_string(), sheet.len()));
+    Ok(())
+}
+
 fn sanitize_asset_name(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -5680,6 +5755,7 @@ fn emit_split_css_files(
     emitted: &mut Vec<(String, usize)>,
     manifest_entries: &mut [ManifestEntry],
     manifest_assets: &mut Vec<ManifestAsset>,
+    stylex_css: &mut Option<String>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let css_map: std::collections::HashMap<String, String> =
         collected_css.lock().unwrap().iter().cloned().collect();
@@ -5689,6 +5765,29 @@ fn emit_split_css_files(
     }
     let mut seen_assets: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
+    // The StyleX sheet joins the first entry chunk's stylesheet (where the
+    // plugin's lands under Vite, whose entry CSS is emitted first), else the
+    // first stylesheet: never a lazy chunk's when an entry has one.
+    let chunks_with_css: Vec<&rolldown_common::OutputChunk> = output
+        .assets
+        .iter()
+        .filter_map(|o| match o {
+            rolldown_common::Output::Chunk(c)
+                if c.modules
+                    .keys
+                    .iter()
+                    .any(|m| css_map.contains_key(m.as_str())) =>
+            {
+                Some(c.as_ref())
+            }
+            _ => None,
+        })
+        .collect();
+    let stylex_chunk = chunks_with_css
+        .iter()
+        .find(|c| c.is_entry)
+        .or(chunks_with_css.first())
+        .map(|c| c.filename.to_string());
     for asset in &output.assets {
         let rolldown_common::Output::Chunk(chunk) = asset else {
             continue;
@@ -5720,6 +5819,11 @@ fn emit_split_css_files(
         if css.is_empty() {
             continue;
         }
+        let css = if stylex_chunk.as_deref() == Some(chunk.filename.as_str()) {
+            append_stylex(css, stylex_css.take())
+        } else {
+            css
+        };
         let hash = content_hash(css.as_bytes());
         let css_name = render_asset_name(
             opts.asset_names,

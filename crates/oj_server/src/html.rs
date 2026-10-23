@@ -31,7 +31,14 @@ pub(crate) async fn serve_html(
             .to_string();
             host.transform_index_html(&raw, &ctx).await
         }
-        None => native_dev_html(state, &raw, url, original_url, file).await,
+        // The host's transform runs the StyleX plugin's hook itself; here its
+        // tags follow the page's own transform (an ordinary, unordered hook).
+        None => native_dev_html(state, &raw, url, original_url, file)
+            .await
+            .map(|out| {
+                let base = state.base.as_deref().unwrap_or("/");
+                dev_html::inject_head_tags(out, &crate::stylex::html_tags(state, base))
+            }),
     };
     match transformed {
         Ok(out) => (
