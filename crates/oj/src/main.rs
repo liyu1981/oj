@@ -558,6 +558,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::StartScript { script, root } => {
+            // A one-shot child: the parent waits on its exit.
+            oj_js::code_cache::consume_only();
             let root = root.canonicalize().context("engine root not found")?;
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
@@ -574,6 +576,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             timeout_secs,
             result,
         } => {
+            oj_js::code_cache::consume_only();
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
                 .context("engine-job payload on stdin")?;
