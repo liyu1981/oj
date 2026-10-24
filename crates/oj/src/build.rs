@@ -3522,6 +3522,7 @@ pub async fn build(root: PathBuf, cli_mode: Option<&str>, cli: CliOptions) -> an
                     relative,
                 )),
                 is_relative_base: relative,
+                worker_entries: Arc::clone(&worker_entries),
             },
         ));
     }
@@ -6336,10 +6337,18 @@ fn emit_split_css_files(
                 entry.css.push(css_name.clone());
             }
         }
-        // Vite keys the stylesheet's manifest row by each source file it was
-        // built from (the asset's `originalFileNames`).
-        for src in &sources {
-            push_css_manifest_row(manifest_assets, root, src, &css_name);
+        // Vite's css-post emits a chunk's sheet under the chunk's own original
+        // file name (getChunkOriginalFileName), and the manifest keeps an asset
+        // row only when no JS chunk holds that key. So a chunk's sheet is only
+        // listed in the chunk's `css`, with a row of its own (keyed by its
+        // sources) only when the chunk left no JS row.
+        let chunk_has_row = manifest_entries
+            .iter()
+            .any(|e| e.file == chunk.filename.as_str());
+        if !chunk_has_row {
+            for src in &sources {
+                push_css_manifest_row(manifest_assets, root, src, &css_name);
+            }
         }
         chunk_css.push((chunk.filename.to_string(), css_name));
     }
