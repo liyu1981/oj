@@ -43,6 +43,7 @@ pub(crate) async fn ensure_module_as(
             .split_once('?')
             .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
     let is_svelte = ext == Some("svelte");
+    let is_stylesheet = ext.is_some_and(is_style_ext);
     // A plain `.svg` with a transform plugin active may be componentized (svgr):
     // route it through the transform pipeline; unmatched svg falls back to a URL asset.
     let svgr_candidate = !react_svg
@@ -68,17 +69,23 @@ pub(crate) async fn ensure_module_as(
         None => load_source(state, file, url, is_dep).await?,
     };
     record_glob_importer(state, file, url, &source);
+    let transform_id = transform_id.map_or_else(|| hook_id(file, url), str::to_string);
     if ext == Some("css") && is_tailwind_css(&source) {
-        let (css, imported) = compile_tailwind(state, file, url, &source).await?;
+        let pre =
+            plugin_transform_phase(state, file, &transform_id, source, is_dep, Some("pre")).await?;
+        let (css, imported) = compile_tailwind(state, file, url, &pre.code).await?;
         // Vite's dev css rewrites a sheet's urls to served paths, so the
         // `<style>` the JS wrapper injects resolves them from any page.
         let dir = file.parent().unwrap_or(Path::new("/"));
         let css = crate::style_file::rewrite_relative_urls(&css, dir, |f| url_of(&state.root, f));
+        let normal =
+            plugin_transform_phase(state, file, &transform_id, css, is_dep, Some("normal")).await?;
         let module = CachedModule {
             is_boundary: true,
             kind: "css".into(),
             imports: css_dep_imports(state, file, &imported),
-            ..code_module(css)
+            watch_files: [pre.watch_files, normal.watch_files].concat(),
+            ..code_module(normal.code)
         };
         return Ok(register_uncached(state, url, module));
     }
@@ -123,7 +130,6 @@ pub(crate) async fn ensure_module_as(
         return Ok((key, module));
     }
 
-    let transform_id = transform_id.map_or_else(|| hook_id(file, url), str::to_string);
     // The StyleX plugin is `enforce: 'pre'`: it compiles the module's own
     // source, ahead of the app's transforms and oj's CJS-interop rewrite (off
     // the async workers: a large module's compile is real work).
@@ -141,17 +147,41 @@ pub(crate) async fn ensure_module_as(
         }
         _ => (source, None, None),
     };
-    let mut transformed = plugin_transform(state, file, &transform_id, source, is_dep).await?;
+    // A stylesheet's "pre" plugins see its source; its "normal" ones the CSS
+    // vite:css makes of it, and its "post" ones what vite:css-post serves
+    // (css_serve). Any other module goes through the whole chain.
+    let phase = |slot| is_stylesheet.then_some(slot);
+    let mut transformed =
+        plugin_transform_phase(state, file, &transform_id, source, is_dep, phase("pre")).await?;
     if let Some(map) = stylex_map {
         transformed.maps.insert(0, map);
+    }
+    let mut css = CssState::default();
+    // PostCSS parses a SugarSS sheet itself: its module names hash that text.
+    if sidecar::is_sugarss(url) {
+        css.scope_source = Some(transformed.code.clone());
     }
     let source = if is_preprocessor(url) {
         preprocess_less_stylus(state, url, transformed.code).await?
     } else {
         transformed.code
     };
-    let mut css = CssState::default();
-    let source = css_prepass(state, file, url, source, &mut css).await?;
+    let source = if is_stylesheet {
+        let compiled = css_prepass(state, file, url, source, &mut css).await?;
+        let normal = plugin_transform_phase(
+            state,
+            file,
+            &transform_id,
+            compiled,
+            is_dep,
+            phase("normal"),
+        )
+        .await?;
+        transformed.watch_files.extend(normal.watch_files);
+        normal.code
+    } else {
+        source
+    };
 
     let source = if react_svg {
         svgr::svg_to_component(&source)
@@ -224,7 +254,7 @@ pub(crate) async fn ensure_module_as(
                     .graph
                     .lock()
                     .unwrap()
-                    .set_self_accepting(Path::new(url), false);
+                    .set_self_accepting(Path::new(graph_url(url)), false);
             }
             return Err(err);
         }
@@ -412,9 +442,10 @@ fn compile_key(
     // must recompile after a dep update so its import carries the new `?t=`.
     let (imports_stamp, invalidated) = {
         let graph = state.graph.lock().unwrap();
+        let node = Path::new(graph_url(url));
         (
-            graph.imports_timestamp(Path::new(url)),
-            graph.invalidation_timestamp(Path::new(url)),
+            graph.imports_timestamp(node),
+            graph.invalidation_timestamp(node),
         )
     };
     let mut mode_key = if imports_stamp > 0 {
@@ -474,7 +505,7 @@ fn persistent_hit(state: &ServerState, key: &str, is_dep: bool) -> Option<Arc<Ca
 
 pub(crate) struct Transformed {
     pub(crate) code: String,
-    watch_files: Vec<String>,
+    pub(crate) watch_files: Vec<String>,
     maps: Vec<String>,
 }
 
@@ -484,6 +515,20 @@ pub(crate) async fn plugin_transform(
     transform_id: &str,
     source: String,
     is_dep: bool,
+) -> Result<Transformed, String> {
+    plugin_transform_phase(state, file, transform_id, source, is_dep, None).await
+}
+
+/// [`plugin_transform`] for one slot of a stylesheet's chain (`"pre"`,
+/// `"normal"` or `"post"`, around Vite's core CSS plugins), or the whole
+/// chain without one.
+pub(crate) async fn plugin_transform_phase(
+    state: &ServerState,
+    file: &Path,
+    transform_id: &str,
+    source: String,
+    is_dep: bool,
+    phase: Option<&str>,
 ) -> Result<Transformed, String> {
     let untouched = |code| Transformed {
         code,
@@ -506,8 +551,14 @@ pub(crate) async fn plugin_transform(
         }
         return Ok(untouched(source));
     }
-    let resolved = resolved_imports_json(&state.resolver, &state.fs_allow, &source, file);
-    match host.transform(&source, transform_id, &resolved).await {
+    let transformed = match phase {
+        Some(phase) => host.transform_phase(&source, transform_id, phase).await,
+        None => {
+            let resolved = resolved_imports_json(&state.resolver, &state.fs_allow, &source, file);
+            host.transform(&source, transform_id, &resolved).await
+        }
+    };
+    match transformed {
         Ok(t) => Ok(Transformed {
             code: t.code,
             watch_files: t.watch_files,
@@ -529,11 +580,7 @@ async fn preprocess_less_stylus(
     url: &str,
     source: String,
 ) -> Result<String, String> {
-    let lang = if sidecar::is_less(url) {
-        "less"
-    } else {
-        "stylus"
-    };
+    let lang = sidecar::preprocess_lang(url).unwrap_or("stylus");
     let cfg = state.css_config.clone().map(|c| oj_config::OjConfig {
         css: Some(c),
         ..Default::default()
@@ -544,6 +591,10 @@ async fn preprocess_less_stylus(
             oj_config::css_preprocessor_json(c, lang),
         ),
         None => (None, serde_json::Value::Null),
+    };
+    let opts = match lang {
+        "sss" => sidecar::sss_engine_options(&state.css_resolve.as_ref()),
+        _ => opts,
     };
     let with_data = match data {
         Some(d) if !d.is_empty() => format!("{d}\n{source}"),
@@ -558,12 +609,17 @@ async fn preprocess_less_stylus(
 struct CssState {
     /// Pulled-in files (@import targets, sass loads), collected for the module graph.
     deps: Vec<PathBuf>,
-    sass_precompiled: bool,
-    imports_inlined: bool,
+    /// A CSS module's class map, its classes scoped in the sheet already.
+    exports: Option<Vec<(String, String)>>,
+    /// The text a module's default names hash, when it is not the sheet
+    /// itself (a SugarSS sheet's source).
+    scope_source: Option<String>,
 }
 
-/// Vite orders Sass before PostCSS, so compile Sass here first when a PostCSS
-/// config applies; the compile step then skips Sass.
+/// A stylesheet as Vite's "normal" plugins get it from vite:css: Sass run (the
+/// other preprocessors ran before), `@import`s inlined (postcss-import is the
+/// first plugin of Vite's PostCSS chain, so imported rules go through the
+/// app's plugins too), the app's PostCSS, then a CSS module's classes scoped.
 async fn css_prepass(
     state: &Arc<ServerState>,
     file: &Path,
@@ -571,7 +627,7 @@ async fn css_prepass(
     source: String,
     css: &mut CssState,
 ) -> Result<String, String> {
-    let source = if state.has_postcss && oj_css::is_sass(url) {
+    let source = if oj_css::is_sass(url) {
         let data = sass_additional_data_for(state, url);
         let load_paths = sass_load_paths_for(state, url);
         let dir = file.parent().map(Path::to_path_buf);
@@ -593,45 +649,52 @@ async fn css_prepass(
         .await
         .map_err(|e| format!("sass compile task failed for {url}: {e}"))??;
         css.deps.extend(deps);
-        css.sass_precompiled = true;
         compiled
     } else {
         source
     };
-    let css_like = css.sass_precompiled
-        || is_preprocessor(url)
-        || file.extension().and_then(|e| e.to_str()) == Some("css");
-    if !(state.has_postcss && css_like) {
-        return Ok(source);
-    }
-    // postcss-import is first in Vite's PostCSS chain: inline @imports before
-    // the PostCSS pass so imported rules go through the user's plugins too.
+    // What Vite hands PostCSS, whose CSS-module names hash it.
+    let postcss_input = css.scope_source.take().unwrap_or_else(|| source.clone());
     let source = oj_css::inline_imports_collecting(
         &source,
         file,
         &state.css_resolve.as_ref(),
         &mut css.deps,
     )?;
-    css.imports_inlined = true;
-    let compiled = match lazy_engine(state, EngineKind::Tailwind).await {
-        Ok(engine) => engine.compile_tracked(&source, url).await,
-        Err(e) => Err(e),
+    let source = if state.has_postcss {
+        let compiled = match lazy_engine(state, EngineKind::Tailwind).await {
+            Ok(engine) => engine.compile_tracked(&source, url).await,
+            Err(e) => Err(e),
+        };
+        match compiled {
+            Ok((out, deps)) => {
+                // The PostCSS deps join the sheet's graph imports, as Vite's
+                // compileCSS adds them to the module's watch files.
+                let files = tokio::task::spawn_blocking(move || css_dep_files(deps, None))
+                    .await
+                    .unwrap_or_default();
+                css.deps.extend(files);
+                out
+            }
+            Err(e) => {
+                eprintln!("oj: postcss failed for {url}: {e}");
+                source
+            }
+        }
+    } else {
+        source
     };
-    Ok(match compiled {
-        Ok((out, deps)) => {
-            // The PostCSS deps join the sheet's graph imports, as Vite's
-            // compileCSS adds them to the module's watch files.
-            let files = tokio::task::spawn_blocking(move || css_dep_files(deps, None))
-                .await
-                .unwrap_or_default();
-            css.deps.extend(files);
-            out
-        }
-        Err(e) => {
-            eprintln!("oj: postcss failed for {url}: {e}");
-            source
-        }
+    if !oj_css::is_css_module(url) {
+        return Ok(source);
+    }
+    let (st, id) = (Arc::clone(state), url.to_string());
+    let scoped = tokio::task::spawn_blocking(move || {
+        oj_css::scope_css_module(&id, &source, &postcss_input, &st.css_resolve.as_ref())
     })
+    .await
+    .map_err(|e| format!("css module task failed for {url}: {e}"))??;
+    css.exports = scoped.exports;
+    Ok(scoped.css)
 }
 
 /// A sheet's pulled-in files as its graph imports, so a dep edit hot-updates
@@ -696,46 +759,31 @@ impl CompileJob {
 
     fn compile_css(self) -> Result<CachedModule, String> {
         let state = &self.state;
-        let mut css_deps = self.css.deps;
         let resolve = state.css_resolve.as_ref();
-        let css_src = if oj_css::is_sass(&self.url) && !self.css.sass_precompiled {
-            let sass_data = sass_additional_data_for(state, &self.url);
-            let sass_load_paths = sass_load_paths_for(state, &self.url);
-            oj_css::compile_sass_collecting(
-                &self.source,
-                &oj_css::SassOptions {
-                    load_dir: Some(&self.dir),
-                    additional_data: sass_data.as_deref(),
-                    load_paths: &sass_load_paths,
-                    resolve,
-                },
-                &mut css_deps,
-            )?
-        } else {
-            self.source
-        };
-        // Plain `@import`s are inlined (postcss-import parity) so the injected
-        // stylesheet does not @import a bare specifier or a wrong-relative url.
-        let css_src = if self.css.imports_inlined {
-            css_src
-        } else {
-            oj_css::inline_imports_collecting(&css_src, &self.file, &resolve, &mut css_deps)?
-        };
         let dev_sourcemap = state
             .css_config
             .as_ref()
             .and_then(|c| c.dev_sourcemap)
             .unwrap_or(false);
-        let output = oj_css::compile_css_dev(&self.url, &css_src, dev_sourcemap, &resolve)?;
-        let dep_imports = css_dep_imports(state, &self.file, &css_deps);
+        let output = match self.css.exports {
+            Some(_) => {
+                oj_css::compile_scoped_css_dev(&self.url, &self.source, dev_sourcemap, &resolve)?
+            }
+            None => oj_css::compile_css_dev(&self.url, &self.source, dev_sourcemap, &resolve)?,
+        };
+        let dep_imports = css_dep_imports(state, &self.file, &self.css.deps);
         // A CSS module's class map changes on edit, so it cannot self-accept
         // (Vite's css-analysis): the update climbs to the importing component.
-        let is_css_module = output.exports.is_some();
+        let is_css_module = self.css.exports.is_some();
+        let inline = self
+            .url
+            .split_once('?')
+            .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "inline"));
         Ok(CachedModule {
-            is_boundary: !is_css_module,
+            is_boundary: !is_css_module && !inline,
             kind: "css".into(),
             imports: dep_imports,
-            css_exports: output.exports.unwrap_or_default(),
+            css_exports: self.css.exports.unwrap_or_default(),
             ..code_module(output.css)
         })
     }
@@ -1104,7 +1152,52 @@ pub(crate) fn fs_allow_from(imports: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The module graph's url for a stylesheet's `?direct` request: the sheet's
+/// own, a `<link>` updating with it. A `?inline` request is a node of its
+/// own, as Vite's module, and never self-accepts: its importer holds the
+/// text, so an edit reaches the importer.
+pub(crate) fn graph_url(url: &str) -> &str {
+    match url.split_once('?') {
+        Some((path, "direct")) => path,
+        _ => url,
+    }
+}
+
+/// A stylesheet's own url, without a `?direct` or `?inline` request's query.
+pub(crate) fn sheet_url(url: &str) -> &str {
+    match url.split_once('?') {
+        Some((path, "direct" | "inline")) => path,
+        _ => url,
+    }
+}
+
+/// The graph node an import names: its file, or a stylesheet's `?inline`
+/// module.
+fn import_node(spec: &str) -> PathBuf {
+    let (path, query) = spec.split_once('?').unwrap_or((spec, ""));
+    let style = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(is_style_ext);
+    if style && query.split('&').any(|kv| kv == "inline") {
+        PathBuf::from(format!("{path}?inline"))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// A sheet's url and its `?direct` and `?inline` requests: what an
+/// invalidation of its file forgets.
+pub(crate) fn url_variants(url: &str) -> [String; 3] {
+    [
+        url.to_string(),
+        format!("{url}?direct"),
+        format!("{url}?inline"),
+    ]
+}
+
 pub(crate) fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
+    let url = graph_url(url);
     // Every path that hands out a module (compile, memory, disk) lands here,
     // so the stylesheet always holds the variant being served.
     crate::stylex::record(state, url, &module.stylex_rules);
@@ -1126,11 +1219,11 @@ pub(crate) fn register_in_graph(state: &ServerState, url: &str, module: &CachedM
         }
     }
     let mut graph = state.graph.lock().unwrap();
-    let local_imports: Vec<&Path> = module
+    let local_imports: Vec<PathBuf> = module
         .imports
         .iter()
         .filter(|s| s.starts_with('/') && !s.starts_with("/@oj/") && !is_worker_query(s))
-        .map(|s| Path::new(s.split('?').next().unwrap_or(s)))
+        .map(|s| import_node(s))
         .collect();
     let pruned = graph.set_imports(Path::new(url), &local_imports);
     if !pruned.is_empty() {
@@ -1420,6 +1513,43 @@ pub(crate) fn interop_node_builtins(source: &str, file: &Path) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+    use super::{graph_url, import_node, sheet_url, url_variants};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_sheets_direct_request_shares_its_graph_node() {
+        assert_eq!(graph_url("/src/a.scss?direct"), "/src/a.scss");
+        // An `?inline` module is a node of its own, as in Vite.
+        assert_eq!(graph_url("/src/a.scss?inline"), "/src/a.scss?inline");
+        assert_eq!(sheet_url("/src/a.scss?inline"), "/src/a.scss");
+        assert_eq!(graph_url("/src/a.scss"), "/src/a.scss");
+        assert_eq!(
+            import_node("/src/a.scss?inline"),
+            PathBuf::from("/src/a.scss?inline")
+        );
+        assert_eq!(
+            import_node("/src/a.scss?t=1&inline"),
+            PathBuf::from("/src/a.scss?inline")
+        );
+        assert_eq!(
+            import_node("/src/a.scss?import"),
+            PathBuf::from("/src/a.scss")
+        );
+        assert_eq!(
+            import_node("/src/a.png?inline"),
+            PathBuf::from("/src/a.png")
+        );
+        // Other queries are modules of their own in the graph too.
+        assert_eq!(
+            graph_url("/index.html?html-proxy&direct&index=0.css"),
+            "/index.html?html-proxy&direct&index=0.css"
+        );
+        assert_eq!(graph_url("/src/a.ts?tsr-split=x"), "/src/a.ts?tsr-split=x");
+        for url in url_variants("/src/a.scss") {
+            assert_eq!(sheet_url(&url), "/src/a.scss", "{url}");
+        }
+    }
+
     #[test]
     fn node_builtins_sorted_for_binary_search() {
         assert!(super::NODE_BUILTINS.windows(2).all(|w| w[0] < w[1]));

@@ -146,6 +146,27 @@ async fn answer(
     })
 }
 
+/// A stylesheet id oj's asset plugin compiles (an import or `?inline`), the
+/// ids Vite's vite:css takes; `?raw`, `?url` and workers load as JS.
+fn is_compiled_stylesheet(id: &str) -> bool {
+    // A plugin-served sheet's `\0` id names a stylesheet as well.
+    let id = id.trim_start_matches('\0');
+    let path = id.split('?').next().unwrap_or(id);
+    match super::assets::asset_tag(id, false) {
+        Some(super::assets::AssetTag::Css) => true,
+        Some(super::assets::AssetTag::Inline) => super::assets::is_style_path(path),
+        _ => false,
+    }
+}
+
+/// A stylesheet id with no file behind it, which only a plugin can serve.
+pub(crate) fn is_served_stylesheet(id: &str) -> bool {
+    let clean = id.split(['?', '#']).next().unwrap_or(id);
+    !id.starts_with("\0oj-")
+        && super::assets::is_style_path(clean.trim_start_matches('\0'))
+        && !Path::new(clean).is_file()
+}
+
 /// A Start bundle's view of one plugin host.
 pub(crate) struct StartHostPlugin {
     host: Arc<PluginHost>,
@@ -246,10 +267,15 @@ fn hook_output(r: ResolvedId) -> HookResolveIdOutput {
     }
 }
 
-/// Specifiers oj's own plugins own: asset and stylesheet imports, which
-/// Vite's core resolver answers before a normal plugin's resolveId sees them.
+/// Specifiers oj's own plugins own: asset imports, which Vite's core
+/// resolver answers before a normal plugin's resolveId sees them. A plain
+/// stylesheet one the core resolver misses (`virtual:theme.css`) is a
+/// plugin's to resolve, as in Vite.
 fn asset_owned(spec: &str) -> bool {
-    super::assets::asset_tag(spec, false).is_some()
+    !matches!(
+        super::assets::asset_tag(spec, false),
+        None | Some(super::assets::AssetTag::Css)
+    )
 }
 
 /// The language of a file read for an id, by the file's extension: `.mts` and
@@ -451,6 +477,12 @@ impl Plugin for StartHostPlugin {
             let fail = |e: String| {
                 oj_server::load_error::load_failed(plugin.clone(), &id, anyhow::anyhow!(e))
             };
+            // A stylesheet a plugin serves with no file behind it (a virtual
+            // sheet, UnoCSS's layers): oj's asset plugin loads it through the
+            // plugins' load and compiles it like a file, as vite:css does.
+            if wants && is_served_stylesheet(&id) {
+                return Ok(None);
+            }
             // `?raw`, `?worker`, an image, a stylesheet: oj's asset plugin
             // loads those, as vite:asset does, after the hooks Vite runs
             // before it (vite-imagetools' `x.webp?w=768`).
@@ -481,18 +513,6 @@ impl Plugin for StartHostPlugin {
                 }
             }
             if let Some(code) = code {
-                if clean.ends_with(".css") {
-                    // A plugin-served virtual stylesheet (UnoCSS's layer
-                    // placeholder): a side-effect stub keeps it in the graph.
-                    return Ok(Some(HookLoadOutput {
-                        code: arcstr::ArcStr::from("export {};\n"),
-                        module_type: Some(ModuleType::Js),
-                        side_effects: Some(
-                            rolldown_common::side_effects::HookSideEffects::NoTreeshake,
-                        ),
-                        ..Default::default()
-                    }));
-                }
                 let module_type = if on_disk && is_app_source(&clean) {
                     file_module_type(&clean)
                 } else {
@@ -549,14 +569,19 @@ impl Plugin for StartHostPlugin {
         let emit = Arc::clone(&self.emit);
         let sourcemap = ctx.inner.options().is_sourcemap_enabled();
         let warnings = (self.command == Command::Build).then(|| Arc::clone(&self.map_warnings));
+        // oj's asset plugin compiled a stylesheet through its "pre" and
+        // "normal" transforms; the module standing in for it gets the "post"
+        // ones, as Vite's vite:css-post output does.
+        let phase = is_compiled_stylesheet(id).then_some("post");
         async move {
             if !pass {
                 return Ok(None);
             }
-            let t = host
-                .transform(code, id, "{}")
-                .await
-                .map_err(|e| anyhow::anyhow!("plugin transform failed for {id}:\n{e}"))?;
+            let t = match phase {
+                Some(phase) => host.transform_phase(code, id, phase).await,
+                None => host.transform(code, id, "{}").await,
+            };
+            let t = t.map_err(|e| anyhow::anyhow!("plugin transform failed for {id}:\n{e}"))?;
             crate::build::forward_emitted_chunks(&ctx.inner, &t.chunks, &emit);
             Ok((t.code != code).then(|| HookTransformOutput {
                 map: crate::build::host_chain_map(
@@ -774,6 +799,48 @@ pub(crate) fn empty_virtual_stub(root: &Path, id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ids vite:css and vite:css-post take (CSS_LANGS_RE, not `?raw`,
+    /// `?url` or a worker): their module gets only the "post" transforms.
+    /// A stylesheet id no file stands behind is a plugin's to serve; a plain
+    /// one the core resolver misses is a plugin's to resolve (Vite asks the
+    /// normal plugins after its resolver), other asset imports are oj's.
+    #[test]
+    fn plugin_served_stylesheets_reach_the_plugins() {
+        assert!(is_served_stylesheet("\0virtual:theme.css"));
+        assert!(is_served_stylesheet("/__uno.css"));
+        assert!(is_served_stylesheet("\0virtual:theme.css?inline"));
+        assert!(!is_served_stylesheet("\0virtual:data.js"));
+        assert!(!is_served_stylesheet("\0oj-shim.css"));
+        assert!(!asset_owned("virtual:theme.css"));
+        assert!(!asset_owned("./a.css"));
+        assert!(asset_owned("./a.css?raw"));
+        assert!(asset_owned("./a.png"));
+        assert!(is_compiled_stylesheet("\0virtual:theme.css"));
+    }
+
+    #[test]
+    fn compiled_stylesheets_are_the_ids_vites_css_plugins_take() {
+        for id in [
+            "/app/a.css",
+            "/app/a.scss",
+            "/app/m.module.css",
+            "/app/b.less?inline",
+            "/app/c.pcss",
+            "/app/d.sss",
+        ] {
+            assert!(is_compiled_stylesheet(id), "{id}");
+        }
+        for id in [
+            "/app/a.css?raw",
+            "/app/a.css?url",
+            "/app/a.css?worker",
+            "/app/a.png?inline",
+            "/app/a.ts",
+        ] {
+            assert!(!is_compiled_stylesheet(id), "{id}");
+        }
+    }
 
     #[test]
     fn plugin_loads_parse_tolerantly_and_files_as_themselves() {

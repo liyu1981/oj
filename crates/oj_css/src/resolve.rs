@@ -38,6 +38,8 @@ static DEFAULT_MODULES: CssModulesOptions = CssModulesOptions {
     generate_scoped_name: None,
     global_scope: false,
     global_module_paths: Vec::new(),
+    hash_prefix: None,
+    context: None,
 };
 
 impl Default for CssResolve<'_> {
@@ -60,12 +62,18 @@ impl Default for CssResolve<'_> {
 pub struct CssModulesOptions {
     /// `camelCase`, `camelCaseOnly`, `dashes` or `dashesOnly`.
     pub locals_convention: Option<String>,
-    /// Default `[name]_[local]_[hash]`.
+    /// None: postcss-modules' default names, as Vite gives them.
     pub generate_scoped_name: Option<String>,
     /// `scopeBehaviour: "global"`.
     pub global_scope: bool,
     /// Regex sources; a matching module file compiles unscoped.
     pub global_module_paths: Vec<String>,
+    /// `hashPrefix`, salting the default names' hash.
+    pub hash_prefix: Option<String>,
+    /// The directory a `generateScopedName` pattern's names hash the file's
+    /// path from: postcss-modules hands generic-names `process.cwd()`, where
+    /// Vite was started. None: the app root.
+    pub context: Option<PathBuf>,
 }
 
 /// Owned `CssResolve` for holders that outlive a borrow.

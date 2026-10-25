@@ -253,6 +253,18 @@ jobs:
         run: node e2e/ssr-stacktrace.mjs
       - name: stylesheet Vite parity (alias, root-absolute, hacks, css modules, ?inline, postcss order)
         run: node e2e/css-vite-parity.mjs
+      - name: CSS module class names are Vite's (default names, dev + build, live Vite check)
+        run: node e2e/css-modules-vite-names.mjs
+      - name: .sss / .pcss / .postcss are stylesheets (sugarss imports, dev + build, live Vite check)
+        run: node e2e/css-postcss-langs.mjs
+      - name: UnoCSS + a plugin-served stylesheet build as in Vite (html pre hooks, css-post, live Vite check)
+        run: node e2e/css-plugin-unocss.mjs
+      - name: dev stylesheet plugin transforms run in Vite's pre/normal/post slots (live Vite check)
+        run: node e2e/css-plugin-slots.mjs
+      - name: start stylesheet plugin transforms run in Vite's slots per environment (live Vite check)
+        run: node e2e/start-css-plugin-slots.mjs
+      - name: start UnoCSS ships its generated sheet as in Vite (live Vite check)
+        run: node e2e/start-css-plugin-unocss.mjs
       - name: start prod build for @cloudflare/vite-plugin is a Worker bundle that renders in workerd
         run: node e2e/start-cloudflare.mjs
       - name: start dev for @cloudflare/vite-plugin serves from the worker; an edit yields a fresh document

@@ -70,7 +70,10 @@ const ASSET_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "woff", "woff2", "ttf", "otf", "eot",
     "mp4", "webm", "wasm",
 ];
-const STYLE_EXTS: &[&str] = &["css", "less", "sass", "scss", "styl", "stylus"];
+/// Vite's CSS_LANGS_RE.
+const STYLE_EXTS: &[&str] = &[
+    "css", "less", "sass", "scss", "styl", "stylus", "pcss", "postcss", "sss",
+];
 
 fn ext_of(path: &str) -> &str {
     Path::new(path)
@@ -162,6 +165,23 @@ impl StyleEngines {
     }
 }
 
+/// A sheet the dev bundle ran through the plugins (see `Styles::dev_sheets`).
+struct DevSheet {
+    stamp: u64,
+    /// For a sheet a plugin serves, a hash of what its `load` returned: the
+    /// sheet is current while the plugin returns the same text, whatever the
+    /// stamp (UnoCSS's grows as modules transform, with no file edit).
+    loaded: Option<u64>,
+    css: String,
+}
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
 /// The stylesheet pipeline the dev server's SSR renders from (preprocessor,
 /// CSS-module scoping, lightningcss), so class names agree across the server
 /// render, the client and the build.
@@ -176,6 +196,13 @@ pub(crate) struct Styles {
     targets: Vec<String>,
     /// The dev urls' prefix under `base`.
     url_base: String,
+    /// The sheets the dev client bundle ran through the plugins, after their
+    /// "normal" transforms, stamped with the bundle that compiled them: a
+    /// page's `<link>` serves one without running the plugins again until the
+    /// next bundle or style edit, as Vite serves a sheet's import and its CSS
+    /// from one transform.
+    dev_sheets: Mutex<HashMap<PathBuf, DevSheet>>,
+    dev_stamp: std::sync::atomic::AtomicU64,
 }
 
 impl Styles {
@@ -189,11 +216,68 @@ impl Styles {
             minify_ssr: oj_config::build_css_minify(&start.config, true),
             targets: oj_config::build_css_targets(&start.config),
             url_base: start.dev_url_base(),
+            dev_sheets: Mutex::new(HashMap::new()),
+            dev_stamp: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A dev bundle started, or a style input changed: every kept sheet may
+    /// be stale.
+    pub fn dev_sheets_stale(&self) {
+        self.dev_stamp
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The current stamp, read before a sheet's sources are, so an edit that
+    /// lands mid-compile leaves what the compile keeps stale.
+    pub(crate) fn dev_stamp(&self) -> u64 {
+        self.dev_stamp.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `loaded`: what a plugin's `load` returned for a sheet with no file.
+    pub(crate) fn keep_dev_sheet(
+        &self,
+        path: &Path,
+        css: String,
+        stamp: u64,
+        loaded: Option<&str>,
+    ) {
+        let sheet = DevSheet {
+            stamp,
+            loaded: loaded.map(text_hash),
+            css,
+        };
+        self.dev_sheets
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), sheet);
+    }
+
+    /// The sheet the current dev bundle compiled for the file at `path`, if
+    /// it did.
+    pub fn dev_sheet(&self, path: &Path) -> Option<String> {
+        let stamp = self.dev_stamp.load(std::sync::atomic::Ordering::SeqCst);
+        self.dev_sheets
+            .lock()
+            .unwrap()
+            .get(path)
+            .filter(|s| s.loaded.is_none() && s.stamp == stamp)
+            .map(|s| s.css.clone())
+    }
+
+    /// The sheet the dev bundle compiled for a plugin-served `id`, if the
+    /// plugin still loads the same text for it.
+    pub fn dev_served_sheet(&self, id: &Path, loaded: &str) -> Option<String> {
+        self.dev_sheets
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|s| s.loaded == Some(text_hash(loaded)))
+            .map(|s| s.css.clone())
     }
 
     fn inputs(&self) -> oj_server::StyleInputs<'_> {
@@ -208,11 +292,13 @@ impl Styles {
         }
     }
 
-    /// A CSS module's or a preprocessor file's compile: its JS (the class
-    /// map) and its CSS.
-    pub async fn compile(&self, path: &Path) -> Result<oj_server::StyleModule, String> {
-        let source =
-            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    /// A CSS module's or a preprocessor file's compile, from its source
+    /// (after the "pre" plugin transforms): its JS (the class map) and its CSS.
+    pub async fn compile(
+        &self,
+        path: &Path,
+        source: String,
+    ) -> Result<oj_server::StyleModule, String> {
         let engine = if oj_server::needs_preprocess_engine(path) {
             Some(self.engines.preprocess(&self.root).await?)
         } else {
@@ -221,10 +307,14 @@ impl Styles {
         oj_server::compile_style_file(&self.inputs(), path, source, engine.as_deref()).await
     }
 
-    /// A dev `?inline` sheet: the module the dev server renders for SSR.
-    pub async fn dev_inline(&self, path: &Path) -> Result<String, String> {
-        let source =
-            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    /// A dev `?inline` sheet: the module the dev server renders for SSR,
+    /// through the "pre" and "normal" slots of `slots`.
+    pub async fn dev_inline(
+        &self,
+        path: &Path,
+        slots: Option<oj_server::StyleSlots<'_>>,
+    ) -> Result<String, String> {
+        let source = oj_server::read_style_source(slots, path).await?;
         let engine = if oj_server::needs_preprocess_engine(path) {
             Some(self.engines.preprocess(&self.root).await?)
         } else {
@@ -239,6 +329,7 @@ impl Styles {
             engine.as_deref(),
             async || engines.tailwind(&root).await,
             &self.url_base,
+            slots,
         )
         .await
     }
@@ -313,6 +404,10 @@ pub(crate) struct Emitter {
     emitting: Mutex<std::collections::HashSet<PathBuf>>,
     /// The emitted client stylesheets, in emit order: the root route's links.
     css_urls: Mutex<Vec<String>>,
+    /// The URL each client stylesheet was emitted at, by its module.
+    sheets: Mutex<HashMap<PathBuf, String>>,
+    /// Every stylesheet emitted, linked or a `?url` asset, in emit order.
+    emitted_css: Mutex<Vec<String>>,
     worker_bundler: Mutex<Option<WorkerBundler>>,
     /// `worker.format` is "es": workers start as modules, not classic scripts.
     worker_module: std::sync::atomic::AtomicBool,
@@ -338,6 +433,8 @@ impl Emitter {
             written: Mutex::new(Default::default()),
             emitting: Mutex::new(Default::default()),
             css_urls: Mutex::new(Vec::new()),
+            sheets: Mutex::new(HashMap::new()),
+            emitted_css: Mutex::new(Vec::new()),
             worker_bundler: Mutex::new(None),
             worker_module: std::sync::atomic::AtomicBool::new(false),
             worker_codes: Mutex::new(HashMap::new()),
@@ -375,7 +472,7 @@ impl Emitter {
             .unwrap_or_default();
         let stem: String = path
             .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
+            .map(|s| s.to_string_lossy().trim_start_matches('\0').to_string())
             .unwrap_or_default()
             .chars()
             .map(|c| {
@@ -430,7 +527,7 @@ impl Emitter {
             {
                 let css = std::fs::read_to_string(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
-                return self.css(path, css).await;
+                return self.css(path, css, None).await;
             }
             let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             self.write(path, &bytes)
@@ -438,13 +535,41 @@ impl Emitter {
     }
 
     /// A stylesheet's text emitted as the file at `path` (a CSS module's
-    /// scoped sheet is not the file's bytes): Tailwind when it uses it, its
-    /// `url()`s emitted, minified under the client's cssMinify (ending in a
-    /// newline, as Vite's finalizeCss), then hashed and recorded.
-    pub async fn css(&self, path: &Path, css: String) -> Result<String, String> {
+    /// scoped sheet is not the file's bytes): Tailwind when it uses it, the
+    /// "normal" plugin transforms of `slots`, its `url()`s emitted, minified
+    /// under the client's cssMinify (ending in a newline, as Vite's
+    /// finalizeCss), then hashed and recorded.
+    pub async fn css(
+        &self,
+        path: &Path,
+        css: String,
+        slots: Option<oj_server::StyleSlots<'_>>,
+    ) -> Result<String, String> {
+        self.sheet(path, css, slots, true).await
+    }
+
+    /// [`Emitter::css`] for a `?url` import: the same file, which the page
+    /// does not link (Vite emits it as an asset, apart from the chunk's CSS).
+    pub async fn css_asset(
+        &self,
+        path: &Path,
+        css: String,
+        slots: Option<oj_server::StyleSlots<'_>>,
+    ) -> Result<String, String> {
+        self.sheet(path, css, slots, false).await
+    }
+
+    async fn sheet(
+        &self,
+        path: &Path,
+        css: String,
+        slots: Option<oj_server::StyleSlots<'_>>,
+        link: bool,
+    ) -> Result<String, String> {
         self.emitting.lock().unwrap().insert(path.to_path_buf());
         let result = async {
             let css = self.styles.tailwind(path, css).await?;
+            let css = oj_server::style_slot(slots, css, "normal").await?;
             let css = self
                 .rewrite_urls(&css, path.parent().unwrap_or(path))
                 .await?;
@@ -455,15 +580,72 @@ impl Emitter {
             };
             // A compiled .scss/.less sheet ships as .css.
             let url = self.write(&path.with_extension("css"), css.as_bytes())?;
+            {
+                let mut emitted = self.emitted_css.lock().unwrap();
+                if !emitted.contains(&url) {
+                    emitted.push(url.clone());
+                }
+            }
+            if !link {
+                return Ok(url);
+            }
             let mut urls = self.css_urls.lock().unwrap();
             if !urls.contains(&url) {
                 urls.push(url.clone());
             }
+            self.sheets
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), url.clone());
             Ok(url)
         }
         .await;
         self.emitting.lock().unwrap().remove(path);
         result
+    }
+
+    /// CSS a plugin routed through the client's `vite:css-post` for module
+    /// `id` (UnoCSS's generated layers): it takes the place of the sheet
+    /// emitted for that module, as vite:css-post keeps one per module, and is
+    /// minified and named like any client sheet. CSS for no emitted sheet is
+    /// linked as a sheet of its own.
+    pub fn plugin_css(&self, id: &str, css: &str) -> Result<(), String> {
+        let path = match id.split(['?', '#']).next().unwrap_or(id) {
+            "" => self.assets_dir.join("plugin.css"),
+            clean => PathBuf::from(clean),
+        };
+        let css = if self.styles.minify_client {
+            format!("{}\n", self.styles.minify(&path, css)?)
+        } else {
+            css.to_string()
+        };
+        let url = self.write(&path.with_extension("css"), css.as_bytes())?;
+        let old = self
+            .sheets
+            .lock()
+            .unwrap()
+            .insert(path.clone(), url.clone());
+        if let Some(old) = &old {
+            for u in self.emitted_css.lock().unwrap().iter_mut() {
+                if u == old {
+                    *u = url.clone();
+                }
+            }
+        }
+        let mut urls = self.css_urls.lock().unwrap();
+        match old.and_then(|old| urls.iter().position(|u| *u == old).map(|i| (i, old))) {
+            Some((i, old)) if old != url => {
+                urls[i] = url;
+                // Nothing else links the placeholder sheet.
+                if let Some((_, file)) = old.rsplit_once("assets/") {
+                    let _ = std::fs::remove_file(self.assets_dir.join(file));
+                }
+            }
+            Some(_) => {}
+            None if !urls.contains(&url) => urls.push(url),
+            None => {}
+        }
+        Ok(())
     }
 
     /// A plugin's late CSS (the StyleX sheet, complete only once every module
@@ -472,7 +654,9 @@ impl Emitter {
     /// the name it was hashed and linked under. With no stylesheet it is the
     /// plugin's writeBundle fallback, `assets/<name>`, linked from nowhere.
     pub fn append_generated_css(&self, name: &str, css: &str) -> Result<(), String> {
-        let first = self.css_urls.lock().unwrap().first().cloned();
+        // The first CSS asset in the bundle, a `?url` one as well (the app
+        // links that one itself).
+        let first = self.emitted_css.lock().unwrap().first().cloned();
         let file = match first.as_deref().and_then(|u| u.rsplit_once("assets/")) {
             Some((_, file)) => self.assets_dir.join(file),
             None => {
@@ -498,8 +682,10 @@ impl Emitter {
         path: &Path,
         css: String,
         server: bool,
+        slots: Option<oj_server::StyleSlots<'_>>,
     ) -> Result<String, String> {
         let css = self.styles.tailwind(path, css).await?;
+        let css = oj_server::style_slot(slots, css, "normal").await?;
         let css = self
             .rewrite_urls(&css, path.parent().unwrap_or(path))
             .await?;
@@ -822,10 +1008,35 @@ pub(crate) enum AssetMode {
 
 pub(crate) const DEV_FS_BASE: &str = "/@oj-start/fs";
 
+/// Where the dev server serves a stylesheet a plugin serves with no file
+/// behind it: its id in Vite's `/@id/` spelling (`\0` as `__x00__`).
+pub(crate) const DEV_ID_BASE: &str = "/@oj-start/id/";
+
+pub(crate) fn dev_id_url(url_base: &str, id: &str) -> String {
+    let mut out = format!("{url_base}{DEV_ID_BASE}");
+    for c in id.replace('\0', "__x00__").chars() {
+        match c {
+            '%' | '?' | '#' | ' ' | '"' | '<' | '>' => out.push_str(&format!("%{:02X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The id a [`dev_id_url`] names, from the part after [`DEV_ID_BASE`]
+/// (percent-decoded already).
+pub(crate) fn id_of_dev_url(rest: &str) -> String {
+    rest.replace("__x00__", "\0")
+}
+
 pub(crate) struct StartAssetsPlugin {
     root: PathBuf,
     styles: Arc<Styles>,
     mode: AssetMode,
+    /// The bundle's plugin host, whose "pre" and "normal" transforms a
+    /// stylesheet runs through as it compiles ("post" ones run on the module
+    /// this loads, as rolldown transforms it).
+    plugins: Option<Arc<oj_server::plugins::PluginHost>>,
 }
 
 impl std::fmt::Debug for StartAssetsPlugin {
@@ -840,7 +1051,13 @@ impl StartAssetsPlugin {
             root: root.to_path_buf(),
             styles,
             mode,
+            plugins: None,
         }
+    }
+
+    pub fn with_plugins(mut self, host: Option<Arc<oj_server::plugins::PluginHost>>) -> Self {
+        self.plugins = host;
+        self
     }
 
     async fn url_for(&self, path: &Path) -> Result<String, String> {
@@ -871,7 +1088,8 @@ impl StartAssetsPlugin {
     async fn module(&self, id: &str, path: &Path) -> Result<Option<String>, String> {
         let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
         let dev = matches!(self.mode, AssetMode::Dev { .. });
-        let Some(tag) = asset_tag(id, dev) else {
+        // A plugin-served sheet's `\0` id takes the tag of what it names.
+        let Some(tag) = asset_tag(id.trim_start_matches('\0'), dev) else {
             // A bare `.svg` (or `?react` one) no plugin componentized: its URL.
             if path.extension().is_some_and(|e| e == "svg") {
                 return Ok(Some(format!(
@@ -882,11 +1100,37 @@ impl StartAssetsPlugin {
             return Ok(None);
         };
         let path_str = path.to_string_lossy();
+        let slots = self
+            .plugins
+            .as_deref()
+            .map(|host| oj_server::StyleSlots { host, id });
         Ok(Some(match tag {
             AssetTag::Raw => {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 format!("export default {};", json(&text))
+            }
+            // Vite's vite:css takes a built `?url` sheet as `?transform-only`:
+            // compiled through the plugins under that id and emitted like a
+            // linked sheet, its module importing that id for the "post" ones.
+            AssetTag::Url if is_style_path(&path_str) && !dev => {
+                let AssetMode::Build { emitter, .. } = &self.mode else {
+                    unreachable!("a build mode")
+                };
+                let only = format!("{}?transform-only", path.display());
+                let slots = self
+                    .plugins
+                    .as_deref()
+                    .map(|host| oj_server::StyleSlots { host, id: &only });
+                let source = oj_server::read_style_source(slots, path).await?;
+                let source = oj_server::style_slot(slots, source, "pre").await?;
+                let css = if is_css_module(&path_str) || !path_str.ends_with(".css") {
+                    self.styles.compile(path, source).await?.css
+                } else {
+                    source
+                };
+                let url = emitter.css_asset(path, css, slots).await?;
+                format!("import {};\nexport default {};", json(&only), json(&url))
             }
             AssetTag::Url => format!("export default {};", json(&self.url_for(path).await?)),
             AssetTag::Inline if is_style_path(&path_str) => match &self.mode {
@@ -894,17 +1138,22 @@ impl StartAssetsPlugin {
                     state
                         .compiled_sheets
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    self.styles.dev_inline(path).await?
+                    self.styles.dev_inline(path, slots).await?
                 }
                 AssetMode::Build {
                     emitter, server, ..
                 } => {
-                    let compiled = self.styles.compile(path).await?;
+                    let source = oj_server::read_style_source(slots, path).await?;
+                    let source = oj_server::style_slot(slots, source, "pre").await?;
+                    let compiled = self.styles.compile(path, source).await?;
                     // A build gives a CSS module's class map even inlined.
                     if is_css_module(&path_str) {
+                        oj_server::style_slot(slots, compiled.css, "normal").await?;
                         compiled.code
                     } else {
-                        let css = emitter.inline_css(path, compiled.css, *server).await?;
+                        let css = emitter
+                            .inline_css(path, compiled.css, *server, slots)
+                            .await?;
                         format!("export default {};", json(&css))
                     }
                 }
@@ -956,19 +1205,47 @@ impl StartAssetsPlugin {
                 // A CSS module or a preprocessor file compiles on oj's CSS
                 // pipeline; a plain `.css` is linked as written (a build
                 // emits it compiled).
+                let emits = matches!(self.mode, AssetMode::Build { server: false, .. });
+                let stamp = self.styles.dev_stamp();
+                let source = oj_server::read_style_source(slots, path).await?;
+                let on_disk = path.is_file();
+                let loaded = (!on_disk).then(|| source.clone());
+                // Only the client build ships this compile. A dev page links
+                // the sheet, and that `?direct` request runs every slot; the
+                // import (and the server build's) runs them too when a plugin
+                // takes the sheet, as in Vite, sparing a compile when none does.
+                let slots = slots.filter(|s| emits || s.host.hook_wants_transform(id, &source));
+                let source = oj_server::style_slot(slots, source, "pre").await?;
                 let compiled = if is_css_module(&path_str) || !path_str.ends_with(".css") {
                     if let AssetMode::Dev { state, .. } = &self.mode {
                         state
                             .compiled_sheets
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    Some(self.styles.compile(path).await?)
+                    Some(self.styles.compile(path, source.clone()).await?)
                 } else {
                     None
                 };
+                let css = || {
+                    compiled
+                        .as_ref()
+                        .map_or_else(|| source.clone(), |c| c.css.clone())
+                };
                 match &self.mode {
-                    AssetMode::Dev { css_urls, .. } => {
-                        let href = self.url_for(path).await?;
+                    AssetMode::Dev {
+                        css_urls, url_base, ..
+                    } => {
+                        if slots.is_some() {
+                            let css = self.styles.tailwind(path, css()).await?;
+                            let css = oj_server::style_slot(slots, css, "normal").await?;
+                            self.styles
+                                .keep_dev_sheet(path, css, stamp, loaded.as_deref());
+                        }
+                        let href = if path.is_file() {
+                            self.url_for(path).await?
+                        } else {
+                            dev_id_url(url_base, id)
+                        };
                         let mut urls = css_urls.lock().unwrap();
                         if !urls.contains(&href) {
                             urls.push(href);
@@ -978,15 +1255,15 @@ impl StartAssetsPlugin {
                         emitter,
                         server: false,
                         ..
-                    } => match &compiled {
-                        Some(c) => {
-                            emitter.css(path, c.css.clone()).await?;
+                    } => {
+                        emitter.css(path, css(), slots).await?;
+                    }
+                    AssetMode::Build { server: true, .. } => {
+                        if slots.is_some() {
+                            let css = self.styles.tailwind(path, css()).await?;
+                            oj_server::style_slot(slots, css, "normal").await?;
                         }
-                        None => {
-                            emitter.emit(path).await?;
-                        }
-                    },
-                    AssetMode::Build { server: true, .. } => {}
+                    }
                 }
                 compiled.map_or_else(|| "export default {};".to_string(), |c| c.code)
             }
@@ -1005,11 +1282,19 @@ impl Plugin for StartAssetsPlugin {
 
     async fn load(&self, _ctx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
         let id = args.id;
-        if id.starts_with('\0') {
-            return Ok(None);
-        }
         let path = Path::new(id.split('?').next().unwrap_or(id));
-        if !path.is_absolute() {
+        // A `?url` sheet's compile, done by its `?url` module: what remains is
+        // the module the "post" plugins see, empty as vite:css-post leaves it.
+        if id.ends_with("?transform-only") && is_style_path(&path.to_string_lossy()) {
+            return Ok(Some(HookLoadOutput {
+                code: arcstr::ArcStr::from(""),
+                module_type: Some(ModuleType::Js),
+                side_effects: Some(rolldown_common::side_effects::HookSideEffects::NoTreeshake),
+                ..Default::default()
+            }));
+        }
+        let served = self.plugins.is_some() && super::host::is_served_stylesheet(id);
+        if !served && (id.starts_with('\0') || !path.is_absolute()) {
             return Ok(None);
         }
         let code = self
@@ -1019,6 +1304,11 @@ impl Plugin for StartAssetsPlugin {
         Ok(code.map(|code| HookLoadOutput {
             code: arcstr::ArcStr::from(code),
             module_type: Some(ModuleType::Js),
+            // A plugin-served sheet stays in its chunk, as Vite keeps CSS
+            // modules (`no-treeshake`): UnoCSS finds its layers by the
+            // chunk's modules.
+            side_effects: served
+                .then_some(rolldown_common::side_effects::HookSideEffects::NoTreeshake),
             ..Default::default()
         }))
     }
@@ -1027,6 +1317,31 @@ impl Plugin for StartAssetsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin-served sheet's dev link, in Vite's `/@id/` spelling, names
+    /// its id again.
+    #[test]
+    fn dev_id_urls_round_trip_the_id() {
+        for id in [
+            "\0virtual:theme.css",
+            "/__uno.css",
+            "\0virtual:a b.css?lang=css",
+        ] {
+            let url = dev_id_url("/base", id);
+            assert!(url.starts_with("/base/@oj-start/id/"), "{url}");
+            assert!(
+                !url.contains('\0') && !url.contains('?') && !url.contains(' '),
+                "{url}"
+            );
+            let rest = url.strip_prefix(&format!("/base{DEV_ID_BASE}")).unwrap();
+            let decoded = rest.replace("%3F", "?").replace("%20", " ");
+            assert_eq!(id_of_dev_url(&decoded), id);
+        }
+        assert_eq!(
+            dev_id_url("", "\0virtual:theme.css"),
+            "/@oj-start/id/__x00__virtual:theme.css"
+        );
+    }
 
     #[test]
     fn asset_imports_classify_like_vites_query_regexes() {

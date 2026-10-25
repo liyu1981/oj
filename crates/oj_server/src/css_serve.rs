@@ -3,13 +3,21 @@ use crate::css_engine::CssDeps;
 
 /// The compiled stylesheet as `text/css` (Vite's `?direct` / raw `<link>` request).
 pub(crate) async fn serve_css_direct(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
-    match ensure_module(state, file, url).await {
-        Ok((_, module)) => (
+    let url = format!("{url}?direct");
+    let css = match ensure_module(state, file, &url).await {
+        Ok((_, module)) => {
+            let id = format!("{}?direct", file.display());
+            css_post(state, file, &url, &id, module.code.clone()).await
+        }
+        Err(err) => Err(err),
+    };
+    match css {
+        Ok(css) => (
             [
                 (header::CONTENT_TYPE, "text/css"),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
-            module.code.clone(),
+            css,
         )
             .into_response(),
         Err(err) => {
@@ -70,7 +78,50 @@ pub(crate) async fn compile_html_style(
     }
     let file = PathBuf::from(format!("{}.css", page_file.display()));
     let (_, module) = ensure_module_as(state, &file, &url, Some(code), Some(&transform_id)).await?;
-    Ok(module.code.clone())
+    css_post(state, &page_file, &url, &transform_id, module.code.clone()).await
+}
+
+/// A stylesheet's "post" plugins (enforce or order "post"), on what Vite's
+/// vite:css-post serves in dev: the CSS itself for a `?direct` request, the
+/// JS module for an import. The sheet's other slots ran in its compile.
+pub(crate) async fn css_post(
+    state: &ServerState,
+    file: &Path,
+    url: &str,
+    id: &str,
+    code: String,
+) -> Result<String, String> {
+    let input = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        code.hash(&mut h);
+        h.finish()
+    };
+    if let Some((_, out)) = state
+        .css_post
+        .lock()
+        .unwrap()
+        .get(id)
+        .filter(|(at, _)| *at == input)
+    {
+        return Ok(out.clone());
+    }
+    let is_dep = is_dep_module(url, file);
+    let t = plugin_transform_phase(state, file, id, code, is_dep, Some("post")).await?;
+    if !t.watch_files.is_empty() {
+        let mut watched = state.plugin_watched.lock().unwrap();
+        for p in &t.watch_files {
+            let p = PathBuf::from(p);
+            ensure_watched_file(state, &p);
+            watched.insert(p);
+        }
+    }
+    state
+        .css_post
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), (input, t.code.clone()));
+    Ok(t.code)
 }
 
 pub(crate) async fn serve_css_wrapper(
@@ -108,6 +159,13 @@ pub(crate) async fn serve_css_wrapper(
          import.meta.hot.prune(() => __oj_removeStyle({url:?}));\n",
         css = serde_json::to_string(&module.code).unwrap(),
     );
+    let body = match css_post(state, file, url, &file.to_string_lossy(), body).await {
+        Ok(body) => body,
+        Err(err) => {
+            send_error(state, &err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
+        }
+    };
     (
         [
             (header::CONTENT_TYPE, "text/javascript"),
@@ -177,7 +235,7 @@ pub(crate) async fn run_css_engine(
 }
 
 pub(crate) fn is_preprocessor(url: &str) -> bool {
-    sidecar::is_less(url) || sidecar::is_stylus(url)
+    sidecar::preprocess_lang(url).is_some()
 }
 
 /// A dependency module (dep/CJS-interop path): JS under node_modules, by url or
@@ -198,7 +256,10 @@ pub(crate) fn is_dep_module(url: &str, file: &Path) -> bool {
 /// Stylesheet extensions (public: the in-process Start module host classifies
 /// resolved paths with the same rule the dev server uses).
 pub fn is_style_ext(ext: &str) -> bool {
-    matches!(ext, "css" | "scss" | "sass" | "less" | "styl" | "stylus")
+    matches!(
+        ext,
+        "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss" | "sss"
+    )
 }
 
 pub(crate) fn is_style_url(url: &str) -> bool {
@@ -295,7 +356,13 @@ pub(crate) async fn compile_tailwind(
     url: &str,
     source: &str,
 ) -> Result<(String, Vec<PathBuf>), String> {
-    state.tailwind_urls.lock().unwrap().insert(url.to_string());
+    // The sheet's own url, as the page links it and HMR updates it (not a
+    // `?direct` or `?inline` request's).
+    state
+        .tailwind_urls
+        .lock()
+        .unwrap()
+        .insert(sheet_url(url).to_string());
     let mut imported = Vec::new();
     let inlined;
     let source = if state.has_postcss {
@@ -517,5 +584,25 @@ mod tailwind_sheet_tests {
         sheets.invalidate();
         sheets.put("/src/index.css", src, started, "a{}".into());
         assert!(sheets.get("/src/index.css", src).is_none());
+    }
+}
+
+#[cfg(test)]
+mod style_ext_tests {
+    use super::*;
+
+    // Vite's CSS_LANGS_RE: /\.(css|less|sass|scss|styl|stylus|pcss|postcss|sss)(?:$|\?)/.
+    #[test]
+    fn style_extensions_are_vites_css_langs() {
+        for ext in [
+            "css", "less", "sass", "scss", "styl", "stylus", "pcss", "postcss", "sss",
+        ] {
+            assert!(is_style_ext(ext), "{ext}");
+        }
+        for ext in ["js", "ts", "json", "svg", "html", "style", "ss"] {
+            assert!(!is_style_ext(ext), "{ext}");
+        }
+        assert!(is_style_url("/src/a.pcss?inline"));
+        assert!(is_style_url("/src/a.sss"));
     }
 }

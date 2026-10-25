@@ -332,9 +332,10 @@ fn classify_id(abs: &str, intent: Option<&'static str>, svg_react: bool) -> Stri
     if oj_server::is_style_ext(&ext) {
         return format!("{abs}?ojasset=css");
     }
-    // wasm is asset-classified like the loader (URL export only).
+    // wasm is asset-classified like the loader (URL export only). A plain
+    // import is `asset`: served like `?url`, but its id has no query.
     if oj_server::is_importable_asset_ext(&ext) || ext == "wasm" {
-        return format!("{abs}?ojasset=url");
+        return format!("{abs}?ojasset=asset");
     }
     abs.to_string()
 }
@@ -833,7 +834,8 @@ impl StartHost {
         }
 
         if let Some(kind) = query.as_deref().and_then(|q| q.strip_prefix("ojasset=")) {
-            return Ok(js(self.asset_module(&clean, kind).await?));
+            let code = self.asset_module(&clean, kind).await?;
+            return Ok(js(self.asset_transform(&clean, kind, code).await?));
         }
 
         // An asset under a query no intent names (vite-imagetools'
@@ -967,6 +969,35 @@ impl StartHost {
         match Path::new(path).strip_prefix(&self.root) {
             Ok(rel) => format!("{base}/{}", rel.to_string_lossy()),
             Err(_) => format!("{base}/@fs{path}"),
+        }
+    }
+
+    /// The SSR environment's plugin transforms over an asset's module, under
+    /// Vite's id for it (`/abs/x.css?url`): vite:asset's JS goes through the
+    /// whole chain, as any module. A stylesheet's `?inline` and a CSS import
+    /// ran their own slots already.
+    async fn asset_transform(
+        &self,
+        path: &str,
+        kind: &str,
+        code: String,
+    ) -> Result<String, String> {
+        let style = oj_server::is_style_ext(&ext_of(path).to_ascii_lowercase());
+        if !matches!(kind, "raw" | "url" | "asset") && !(kind == "inline" && !style) {
+            return Ok(code);
+        }
+        // A plain asset import's id is the file's, as Vite's.
+        let id = match kind {
+            "asset" => path.to_string(),
+            _ => format!("{path}?{kind}"),
+        };
+        match self.bridge.plugin_host().await {
+            Some(host) if host.hook_wants_transform(&id, &code) => host
+                .transform(&code, &id, "{}")
+                .await
+                .map(|t| t.code)
+                .map_err(|e| format!("plugin transform error for {id}:\n{e}")),
+            _ => Ok(code),
         }
     }
 
@@ -1464,7 +1495,7 @@ mod tests {
         );
         assert_eq!(
             classify_id("/a/hero.png", None, false),
-            "/a/hero.png?ojasset=url"
+            "/a/hero.png?ojasset=asset"
         );
         assert_eq!(
             classify_id("/a/n.txt", Some("raw"), false),
@@ -1475,7 +1506,7 @@ mod tests {
         assert_eq!(classify_id("/a/x.tsx", None, false), "/a/x.tsx");
         assert_eq!(
             classify_id("/a/m.wasm", None, false),
-            "/a/m.wasm?ojasset=url"
+            "/a/m.wasm?ojasset=asset"
         );
     }
 
