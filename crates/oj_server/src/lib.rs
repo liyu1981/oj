@@ -409,6 +409,7 @@ struct ServerState {
     client_js: Bytes,
     /// Validator for `/@oj/client.js` (fixed per process).
     client_js_etag: String,
+    oj_paths: OjPublicPaths,
     /// Per module url, the `import.meta.glob` patterns it expands (absolute): a file
     /// created or deleted under one recompiles + hot-updates the module (Vite parity).
     glob_importers: Mutex<HashMap<String, Vec<oj_compiler::glob::GlobMatcher>>>,
@@ -1331,11 +1332,15 @@ fn build_router(
         .route("/@oj/client.js", get(serve_client_js))
         .route(
             "/@oj/refresh-runtime.js",
-            get(|| async { js(REFRESH_RUNTIME_JS) }),
+            get(|State(state): State<Arc<ServerState>>| async move {
+                js(state.oj_paths.refresh_runtime_js.clone())
+            }),
         )
         .route(
             "/@oj/refresh-preamble.js",
-            get(|| async { js(REFRESH_PREAMBLE_JS) }),
+            get(|State(state): State<Arc<ServerState>>| async move {
+                js(state.oj_paths.refresh_preamble_js.clone())
+            }),
         )
         .route("/@oj/routes.js", get(serve_oj_routes))
         // OJ_DEBUG_MEM=1: force a full V8 collection in every live engine so memory
@@ -1812,6 +1817,7 @@ impl DevServer {
                 &blake3::hash(hmr.client_js.as_bytes()).to_hex()[..16]
             ),
             client_js: Bytes::from(hmr.client_js),
+            oj_paths: OjPublicPaths::new(dev_base(config.base.as_deref()).as_deref()),
             glob_importers: Mutex::new(HashMap::new()),
             app_type,
             watch_ignored,
