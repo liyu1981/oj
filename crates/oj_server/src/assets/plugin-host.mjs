@@ -1543,6 +1543,7 @@ function pluginContext(c) {
         attributes: options && options.attributes,
         custom: options && options.custom,
         isEntry: !!(options && options.isEntry),
+        scan: !!(this && this._scan),
       });
       if (viaPlugin != null) return viaPlugin;
       const map = transformResolveStore.getStore();
@@ -1681,11 +1682,12 @@ function ctxFor(c, p) {
 }
 
 // Vite's ResolveIdContext carries the chain's skipCalls, so a nested
-// ctx.resolve accumulates onto the whole chain instead of starting over.
-function resolveHookCtx(c, p, skipCalls) {
+// ctx.resolve accumulates onto the whole chain instead of starting over, and
+// the chain's `scan`, which a nested ctx.resolve passes on (`scan: this._scan`).
+function resolveHookCtx(c, p, skipCalls, scan) {
   const base = ctxFor(c, p);
-  if (!skipCalls) return base;
-  return Object.create(base, { _resolveSkipCalls: { value: skipCalls } });
+  if (!skipCalls && !scan) return base;
+  return Object.create(base, { _resolveSkipCalls: { value: skipCalls }, _scan: { value: scan } });
 }
 
 // Vite's BasicMinimalPluginContext, the `this` of config, configEnvironment,
@@ -4251,7 +4253,7 @@ async function resolveIdFull(c, source, importer, opts) {
     if (!hookIdMatches(p.resolveId, source)) continue;
     let r;
     try {
-      r = await handler.call(resolveHookCtx(c, p, skipCalls), source, importer || undefined, options);
+      r = await handler.call(resolveHookCtx(c, p, skipCalls, options.scan), source, importer || undefined, options);
     } catch (e) {
       throw decoratePluginError(e, p, importer || source);
     }
@@ -4468,9 +4470,13 @@ async function scanPluginHook(hook, argsJson) {
   for (const p of await scanPluginList()) {
     const fn = hookFn(p, hook);
     if (!fn) continue;
+    // Under Vite these plugins run in the scan's own rolldown build: a
+    // `this.resolve` from any of their hooks goes through vite:dep-scan:resolve,
+    // which asks the app's plugins with `scan: true`.
+    const ctx = resolveHookCtx(main, p, null, true);
     if (hook === "resolveId") {
       if (!hookIdMatches(p.resolveId, args[0])) continue;
-      const r = await fn.call(ctxFor(main, p), args[0], args[1] ?? undefined, {
+      const r = await fn.call(ctx, args[0], args[1] ?? undefined, {
         attributes: {},
         custom: {},
         isEntry: !!args[2]?.isEntry,
@@ -4482,13 +4488,13 @@ async function scanPluginHook(hook, argsJson) {
       if (r.id != null) return JSON.stringify({ id: r.id, external: r.external ?? false });
     } else if (hook === "load") {
       if (!hookIdMatches(p.load, args[0])) continue;
-      const r = await fn.call(ctxFor(main, p), args[0]);
+      const r = await fn.call(ctx, args[0]);
       if (r == null) continue;
       if (typeof r === "string") return JSON.stringify({ code: r });
       if (r.code != null) return JSON.stringify({ code: r.code, moduleType: r.moduleType });
     } else if (hook === "transform") {
       if (!hookTransformMatches(p.transform, args[1], args[0])) continue;
-      const r = await fn.call(ctxFor(main, p), args[0], args[1]);
+      const r = await fn.call(ctx, args[0], args[1]);
       const code = typeof r === "string" ? r : r?.code;
       if (code != null) args[0] = code;
     }

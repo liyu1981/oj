@@ -3,8 +3,8 @@
 
 //! The optimizer over real packages in a temp app: what the scan finds, what
 //! the bundle writes, and the metadata the dev server gets. The scan runs
-//! without a plugin host here; e2e/dep-optimize-rolldown.mjs covers the
-//! plugin-aware half.
+//! without a plugin host here, but for how it paces its calls into one;
+//! e2e/dep-optimize-rolldown.mjs covers the plugin-aware half.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1050,4 +1050,118 @@ fn symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).unwrap();
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+// Rolldown hands the scan a whole crawl's resolves at once. The plugin host
+// takes at most SCAN_HOST_TURNS of them at a time, so a dev request's hook
+// never queues behind the whole crawl (issue #332), while enough overlap
+// that a plugin awaiting its own work keeps the crawl near its pace.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scan_bounds_the_resolves_waiting_in_the_plugin_host() {
+    let app = App::new();
+    let mut main = String::new();
+    for i in 0..200 {
+        app.write(
+            &format!("src/m{i}.js"),
+            &format!("export const v{i} = {i};\n"),
+        );
+        main.push_str(&format!("import \"./src/m{i}.js\";\n"));
+    }
+    app.write("main.js", &main);
+    let peak = app.root().join("peak.txt");
+    app.write(
+        "oj.plugins.mjs",
+        &format!(
+            r#"import {{ writeFileSync }} from "node:fs";
+let inFlight = 0;
+let peak = 0;
+export default [{{
+  name: "in-flight",
+  async resolveId(id, importer, options) {{
+    if (!options?.scan) return null;
+    peak = Math.max(peak, ++inFlight);
+    writeFileSync({peak:?}, String(peak));
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return null;
+  }},
+}}];
+"#
+        ),
+    );
+    let config = json!({
+        "config": { "root": app.root().display().to_string() },
+        "env": { "command": "serve", "mode": "development" },
+    })
+    .to_string();
+    let host = crate::plugins::PluginHost::spawn(
+        &app.root(),
+        &app.root().join("oj.plugins.mjs"),
+        &config,
+        None,
+    )
+    .await
+    .expect("the plugin host spawns");
+    let input = OptimizeInput {
+        entries: app.entry("main.js"),
+        ..Default::default()
+    };
+    let pre = app.prebundle(&input, &[]);
+    pre.scan(Some(&host)).await;
+    host.shutdown();
+    let peak: usize = std::fs::read_to_string(&peak).unwrap().parse().unwrap();
+    assert!(
+        peak > 1 && peak <= super::scan::SCAN_HOST_TURNS,
+        "scan resolves in the plugin host at once: {peak}"
+    );
+}
+
+// Vite's ctx.resolve passes the chain's `scan` on (`scan: this._scan`,
+// pluginContainer.ts): a plugin that this.resolves during the scan reaches
+// the other plugins as a scan resolve too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_resolve_in_the_scan_is_a_scan_resolve() {
+    let app = App::new();
+    app.write(
+        "oj.plugins.mjs",
+        r#"export default [
+  {
+    name: "outer",
+    async resolveId(id, importer, options) {
+      if (id !== "probe") return null;
+      return this.resolve("nested", importer, { skipSelf: true });
+    },
+  },
+  {
+    name: "inner",
+    resolveId(id, importer, options) {
+      if (id === "nested") return { id: "/scan-" + options.scan, external: true };
+      return null;
+    },
+  },
+];
+"#,
+    );
+    let config = json!({
+        "config": { "root": app.root().display().to_string() },
+        "env": { "command": "serve", "mode": "development" },
+    })
+    .to_string();
+    let host = crate::plugins::PluginHost::spawn(
+        &app.root(),
+        &app.root().join("oj.plugins.mjs"),
+        &config,
+        None,
+    )
+    .await
+    .expect("the plugin host spawns");
+    let importer = app.root().join("main.js").to_string_lossy().into_owned();
+    let scanned = host.scan_resolve_id("probe", &importer).await;
+    let served = host.resolve_id("probe", &importer).await;
+    host.shutdown();
+    assert_eq!(
+        scanned.unwrap().map(|r| r.id),
+        Some("/scan-true".to_string())
+    );
+    assert_eq!(served.unwrap().as_deref(), Some("/scan-false"));
 }
