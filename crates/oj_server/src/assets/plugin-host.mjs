@@ -783,15 +783,19 @@ environment.transformRequest = async (rawId) => {
 const main = createContainer(0, environment, environment.config);
 
 // When the app has Vite installed and its config is a vite.config, ask that Vite
-// to resolve the user's config once (fresh plugin instances, whose config hooks
-// run in that resolve) and use the result as the base the plugins see: real
-// build.outDir/sourcemap/rollupOptions, cacheDir, env, envPrefix, assetsInclude(),
-// css, ssr, worker, createResolver, logger. oj's own plugin instances are spliced
-// in and their config hooks still run on top. Without Vite the synthesized
-// defaults stand.
+// to resolve the user's config once and use the result as the base the plugins
+// see: real build.outDir/sourcemap/rollupOptions, cacheDir, env, envPrefix,
+// assetsInclude(), css, ssr, worker, createResolver, logger. Like Vite's
+// createServer, the file is evaluated once: the resolve runs over the config
+// loadViteConfig already loaded and the host's own plugin instances, each
+// config hook running once under Vite with its result recorded for
+// runConfigHooks to replay (the later config-phase hooks run only in the
+// host). Without Vite the synthesized defaults stand.
 let userResolvedViteConfig = null;
+// What each hosted plugin's config hook returned inside Vite's resolve.
+const recordedConfigPartials = new Map();
 async function loadUserResolvedViteConfig() {
-  if (initial.pluginsFormat !== "vite") return null;
+  if (initial.pluginsFormat !== "vite" || !userViteConfig) return null;
   const appRoot = initial.config?.root ?? process.cwd();
   let vite;
   try {
@@ -800,49 +804,216 @@ async function loadUserResolvedViteConfig() {
     return null;
   }
   if (typeof vite.resolveConfig !== "function") return null;
+  // A Start SSR or bundle host resolves without the framework plugins oj
+  // reimplements, as it runs without them: their config hooks (the router
+  // generator's among them) do work oj's own pipeline does.
+  const candidates = startLeavesOutReimplemented ? allPlugins.filter((p) => !isReimplemented(p.name)) : allPlugins;
+  const hosted = new Set(main.plugins);
+  const restores = [];
+  // Through the config hooks the hidden hooks still read as the plugin's own
+  // (a sibling may wrap one); Vite reads them only after, by when they hide.
+  const phase = { hidden: false };
+  const plugins = candidates.map((p) => {
+    if (!hosted.has(p)) return p;
+    const restore = recordInPlace(p, phase);
+    if (!restore) return recordingPlugin(p);
+    restores.push(restore);
+    return p;
+  });
+  // The file under oj's CLI-level values, as resolveConfig merges a loaded
+  // file under the inline config before any config hook runs.
+  const fileConfig = plainCopy(userViteConfig);
+  // Vite's configEnv reads `isSsrBuild` off the inline config alone, before
+  // the file loads: a build's `build.ssr` from the file joins the config
+  // through the first config hook instead, so the hooks see it in the config
+  // but not in configEnv.
+  const fileSsr = env.command === "build" ? fileConfig.build?.ssr : undefined;
+  if (fileSsr) {
+    fileConfig.build = { ...fileConfig.build };
+    delete fileConfig.build.ssr;
+    plugins.unshift({
+      name: "oj:file-build-ssr",
+      enforce: "pre",
+      config: { order: "pre", handler: () => ({ build: { ssr: fileSsr } }) },
+    });
+  }
+  plugins.push({
+    name: "oj:config-hooks-done",
+    enforce: "post",
+    config: {
+      order: "post",
+      handler() {
+        phase.hidden = true;
+      },
+    },
+  });
+  const merge = typeof vite.mergeConfig === "function" ? vite.mergeConfig : mergeConfigLite;
   try {
     // Vite's own NODE_ENV handling runs inside resolveConfig; hand it the
     // command-based defaultNodeEnv (never the mode) and lift oj's untouched
     // pre-set first so it computes isNodeEnvSet like a real CLI run.
     unsetOjNodeEnvForResolve();
-    const rc = await asNode(async () => {
-      if (!startLeavesOutReimplemented || typeof vite.loadConfigFromFile !== "function") {
-        return vite.resolveConfig(
-          { root: appRoot, configFile: pluginsPath, mode: env.mode, logLevel: "silent" },
-          env.command,
-          env.mode,
-          defaultNodeEnv,
-        );
-      }
-      // A Start SSR or bundle host resolves without the framework plugins oj
-      // reimplements, as it runs without them: their config hooks (the
-      // router generator's among them) do work oj's own pipeline does.
-      const loaded = await vite.loadConfigFromFile(
-        { command: env.command, mode: env.mode, isSsrBuild: env.isSsrBuild, isPreview: false },
-        pluginsPath,
-        appRoot,
-        "silent",
-      );
-      const config = loaded?.config ?? {};
-      const kept = (await flattenPlugins(config.plugins)).filter((p) => !isReimplemented(p.name));
-      return vite.resolveConfig(
-        { ...config, plugins: kept, root: appRoot, configFile: false, mode: env.mode, logLevel: "silent" },
+    const rc = await asNode(() =>
+      vite.resolveConfig(
+        {
+          ...merge(fileConfig, cliInlineConfig()),
+          plugins,
+          root: appRoot,
+          configFile: false,
+          mode: env.mode,
+          logLevel: "silent",
+        },
         env.command,
         env.mode,
         defaultNodeEnv,
-      );
-    });
-    return rc && typeof rc === "object" ? rc : null;
+      ),
+    );
+    if (!rc || typeof rc !== "object") return null;
+    // What a resolve that loaded the file itself reports.
+    rc.configFile = pluginsPath;
+    rc.configFileDependencies = userConfigDependencies;
+    rc.inlineConfig = { root: appRoot, configFile: pluginsPath, mode: env.mode, logLevel: "silent" };
+    return rc;
   } catch (e) {
     process.stderr.write(
       `${OJ} plugin host: vite.resolveConfig failed, using synthesized config: ${(e && e.message) || e}\n`,
     );
     return null;
   } finally {
+    for (const restore of restores) {
+      try {
+        restore();
+      } catch {}
+    }
     // A throwing resolveConfig may leave the unset behind; the fallback paths
     // below still evaluate config/plugin code that must see a value.
     if (!process.env.NODE_ENV) process.env.NODE_ENV = defaultNodeEnv;
   }
+}
+// What oj's command line set (`--port`, `--host`), as a Vite CLI run puts
+// it in the inline config: the config hooks see it over the file's values.
+function cliInlineConfig() {
+  const cli = initial.cliInline;
+  return cli && typeof cli === "object" ? plainCopy(cli) : {};
+}
+// oj's values without the command line's, which Vite's resolve already took
+// in under the config hooks (a hook's in-place edit of one stands). The rest
+// (base, the bound port when none was passed) overlay the resolved config,
+// so the host serves what oj serves.
+function withoutCliInline(o) {
+  const cliServer = cliInlineConfig().server;
+  if (!cliServer || !o?.server) return o ?? {};
+  const kept = { ...o.server };
+  for (const k of Object.keys(cliServer)) delete kept[k];
+  return { ...o, server: kept };
+}
+// The hooks `p` shows Vite's resolve: its config hook recorded (what it
+// returned, or threw, for runConfigHook to replay), its configEnvironment,
+// configResolved and applyToEnvironment hidden, left to the host, which runs
+// them on its own resolved config.
+function resolveHooks(p) {
+  const hook = p.config;
+  const fn = hookFn(p, "config");
+  const record = async function (config, configEnv) {
+    try {
+      const partial = await fn.call(this, config, configEnv);
+      // Returning the config itself is an in-place edit, already in the base.
+      recordedConfigPartials.set(p, { partial: partial === config ? null : plainCopy(partial) });
+      return partial;
+    } catch (error) {
+      recordedConfigPartials.set(p, { error });
+      throw error;
+    }
+  };
+  return {
+    config: fn ? (typeof hook === "function" ? record : { ...hook, handler: record }) : undefined,
+    configEnvironment: undefined,
+    configResolved: undefined,
+    applyToEnvironment: undefined,
+  };
+}
+// Swaps `p`'s hooks for the resolve's on the instance itself, so the plugin
+// list Vite hands the config hooks holds the real objects (a sibling lookup
+// or identity check sees the plugin the host runs). Returns the undo, or
+// null when `p` cannot take the swap (frozen).
+function recordInPlace(p, phase) {
+  const hooks = resolveHooks(p);
+  const undo = [];
+  const restore = () => {
+    for (const u of undo.reverse()) {
+      try {
+        u();
+      } catch {}
+    }
+  };
+  try {
+    for (const [key, value] of Object.entries(hooks)) {
+      const own = Object.getOwnPropertyDescriptor(p, key);
+      const enumerable = own?.enumerable ?? false;
+      const original = p[key];
+      // A hidden hook reads as unset to Vite (which reads it after the config
+      // hooks); one the plugin assigns meanwhile (a config hook giving itself
+      // a configResolved, or wrapping a sibling's) is held back for the host,
+      // which runs it once, as Vite would.
+      let assigned;
+      let wasAssigned = false;
+      const hidden = {
+        get: () => (phase.hidden ? undefined : wasAssigned ? assigned : original),
+        set: (v) => {
+          assigned = v;
+          wasAssigned = true;
+        },
+      };
+      const swapped =
+        value === undefined
+          ? { ...hidden, configurable: true, enumerable }
+          : { value, writable: true, configurable: true, enumerable };
+      Object.defineProperty(p, key, swapped);
+      undo.push(() => {
+        const now = Object.getOwnPropertyDescriptor(p, key);
+        if (wasAssigned) {
+          Object.defineProperty(p, key, { value: assigned, writable: true, configurable: true, enumerable });
+        } else if (now && (now.get === hidden.get || (value !== undefined && now.value === value))) {
+          if (own) Object.defineProperty(p, key, own);
+          else delete p[key];
+        }
+        // Otherwise the plugin redefined the hook itself: it keeps that.
+      });
+    }
+  } catch {
+    restore();
+    return null;
+  }
+  return restore;
+}
+// `p` behind a wrapper carrying the resolve's hooks, for a plugin that
+// cannot take them in place (frozen: no sibling can wrap its hooks either).
+function recordingPlugin(p) {
+  const hooks = resolveHooks(p);
+  return Object.create(p, Object.fromEntries(Object.entries(hooks).map(([k, value]) => [k, { value }])));
+}
+// A copy of `v`'s plain data (object literals and arrays); functions, RegExps
+// and class instances are kept by reference, and so are the plugins of a
+// `plugins` list: a copy of a plugin is another instance.
+function plainCopy(v, seen = new WeakMap()) {
+  if (!v || typeof v !== "object") return v;
+  const cached = seen.get(v);
+  if (cached) return cached;
+  if (Array.isArray(v)) {
+    const out = [];
+    seen.set(v, out);
+    for (const x of v) out.push(plainCopy(x, seen));
+    return out;
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return v;
+  const out = {};
+  seen.set(v, out);
+  for (const [k, x] of Object.entries(v)) out[k] = k === "plugins" ? pluginListCopy(x) : plainCopy(x, seen);
+  return out;
+}
+function pluginListCopy(v) {
+  return Array.isArray(v) ? v.map(pluginListCopy) : v;
 }
 
 // Vite's `externalize-deps` config-bundling plugin, mirrored (one copy lives
@@ -1133,6 +1304,8 @@ async function bundleViteConfigFile(configPath, appRoot) {
   };
 }
 
+// The files the config evaluation read (Vite's configFileDependencies).
+let userConfigDependencies = [];
 async function loadViteConfig(configPath) {
   const appRoot = initial.config?.root ?? process.cwd();
   let vite = null;
@@ -1156,7 +1329,10 @@ async function loadViteConfig(configPath) {
         appRoot,
       ),
     );
-    if (loaded && loaded.config) return loaded.config;
+    if (loaded && loaded.config) {
+      userConfigDependencies = loaded.dependencies ?? [];
+      return loaded.config;
+    }
   }
   let mod;
   if (/\.(ts|tsx|mts|cts)$/.test(configPath)) {
@@ -1721,12 +1897,14 @@ let hookedUserConfig = {};
 // `onPartial` sees each plugin's contribution; `keepPlugins` pins the plugin
 // array across the merges (mergeConfigLite concatenates arrays). A skipped
 // hook marks `container`.
-async function runConfigHook(config, list, { onPartial, keepPlugins, container = main } = {}) {
+async function runConfigHook(config, list, { onPartial, keepPlugins, container = main, recorded } = {}) {
   const configContext = minimalContext();
   for (const { p, fn } of hooksOf(list, "config")) {
     initStage(`config:${p.name ?? "?"}`);
     try {
-      const partial = await fn.call(configContext, config, env);
+      const rec = recorded?.get(p);
+      if (rec?.error) throw rec.error;
+      const partial = rec ? rec.partial : await fn.call(configContext, config, env);
       if (partial) {
         config = mergeConfigLite(config, partial);
         onPartial?.(partial);
@@ -1759,23 +1937,26 @@ async function runConfigHooks() {
   initStage("user-config-resolved");
   let config = initial.config ?? {};
   if (userResolvedViteConfig) {
-    // The user's resolved config is the base; oj's own values (root, base,
-    // define, server, environments) overlay it; the plugin list is replaced below.
+    // The user's resolved config is the base; oj's own values (root, define,
+    // server, environments) overlay it, but for the CLI-level ones Vite's
+    // resolve already took in; the plugin list is replaced below.
     const { plugins: _fresh, ...base } = userResolvedViteConfig;
-    config = mergeConfigLite(base, config);
+    config = mergeConfigLite(base, withoutCliInline(config));
   }
   // Coerce experimental.bundledDev off BEFORE the config/configResolved hooks
   // run, so TanStack's start-manifest-plugin emits the standard dev client entry
   // (not `/assets/index.js`) and any bundled-dev middleware early-returns.
   coerceBundledDevOff(config);
-  // Vite hands the config hook the user config, whose `plugins` is the flat
-  // plugin array; plugins like @crxjs read `config.plugins` to find sibling
-  // plugins. Use the apply-filtered active set (not allPlugins) so command-
-  // inappropriate plugins are absent, matching Vite's resolved config — e.g.
-  // `@crxjs`'s serve-only `crx:hmr` must not appear during a build, or crx calls
-  // its `transformCrxManifest` (which reads an unset `config`) and throws.
-  // The exposed plugin array: the apply-filtered active set plus the css-post
-  // shim. Pinned across the config-hook merges below so mergeConfigLite (which
+  // A config hook that ran inside Vite's resolve saw Vite's user config and
+  // its plugin list; the hooks the host runs itself (no Vite in the app, or a
+  // hook Vite's apply skipped) see this config, and configResolved sees it as
+  // the resolved plugin array. Plugins like @crxjs read `config.plugins` to
+  // find sibling plugins. Use the apply-filtered active set (not allPlugins)
+  // so command-inappropriate plugins are absent, matching Vite's resolved
+  // config — e.g. `@crxjs`'s serve-only `crx:hmr` must not appear during a
+  // build, or crx calls its `transformCrxManifest` (which reads an unset
+  // `config`) and throws. The exposed plugin array: the apply-filtered active
+  // set plus the css-post shim. Pinned across the config-hook merges below so mergeConfigLite (which
   // concatenates arrays) can't accumulate it into duplicates.
   // The natively reimplemented React plugins stay listed (hooks unrun), in
   // enforce order like Vite's resolved plugin array.
@@ -1788,6 +1969,8 @@ async function runConfigHooks() {
     onPartial: (partial) => (pluginConfigDelta = mergeConfigLite(pluginConfigDelta, partial)),
     // Keep the plugin array stable regardless of what a config hook returned.
     keepPlugins: configPlugins,
+    // The hooks Vite's resolve already ran on these instances.
+    recorded: recordedConfigPartials,
   });
   // Vite runs `configEnvironment(name, options, env)` for every environment after
   // the config hooks and merges what it returns into that environment's options.
