@@ -370,6 +370,8 @@ pub struct Restarter {
     pub(crate) start: bool,
     /// A check is running; the newest reason asked for meanwhile.
     pending: Mutex<(bool, Option<String>)>,
+    /// A check failed: the config on disk does not boot.
+    failed: std::sync::atomic::AtomicBool,
 }
 
 impl Restarter {
@@ -385,7 +387,28 @@ impl Restarter {
             mode,
             start,
             pending: Mutex::new((false, None)),
+            failed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Restart for an input the config did not change (the start entry
+    /// appearing or disappearing), without the check: the config is the one
+    /// this server booted from, and a check's evaluation would run the
+    /// framework's plugins while this server's own still react to file
+    /// events, so a route generator holding the old entry could write its
+    /// tree over the check's. A config that failed its check, or one being
+    /// checked, is checked as any request is.
+    pub fn request_unchecked(self: &Arc<Self>, reason: &str) {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.0 || self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(pending);
+                return self.request(reason);
+            }
+            // No check starts after this one: the process is replaced.
+            pending.0 = true;
+        }
+        restart_process(&self.root, reason)
     }
 
     /// Restart the dev server, as Vite's `server.restart()` does: the new
@@ -419,6 +442,7 @@ impl Restarter {
                 // came during this check is checked before the exec.
                 None if this.pending.lock().unwrap().1.is_some() => {}
                 Some(error) => {
+                    this.failed.store(true, std::sync::atomic::Ordering::SeqCst);
                     eprintln!("{} {error}", oj_brand());
                     eprintln!("{} server restart failed", oj_brand());
                     oj_diag::emit(
@@ -429,7 +453,7 @@ impl Restarter {
                         .warn(),
                     );
                 }
-                None => restart_process(&reason),
+                None => restart_process(&this.root, &reason),
             }
         });
     }
@@ -471,9 +495,9 @@ impl Restarter {
     }
 }
 
-pub fn restart_process(reason: &str) -> ! {
+pub fn restart_process(root: &Path, reason: &str) -> ! {
     if let Some(hook) = RESTART_HOOK.get() {
-        hook(reason);
+        hook(root, reason);
     }
     eprintln!("{} {reason} — restarting dev server", oj_brand());
     oj_diag::emit(
@@ -524,12 +548,14 @@ pub fn restart_process(reason: &str) -> ! {
     }
 }
 
-static RESTART_HOOK: std::sync::OnceLock<fn(&str) -> !> = std::sync::OnceLock::new();
+static RESTART_HOOK: std::sync::OnceLock<fn(&Path, &str) -> !> = std::sync::OnceLock::new();
 
 /// Takes every restart in place of the exec, for a process hosting dev
 /// servers it must outlive (oj's integration tests): an exec there would
-/// replace the whole process. Set once; later calls are ignored.
-pub fn set_restart_hook(hook: fn(&str) -> !) {
+/// replace the whole process. The hook gets the restarting app's root, so a
+/// restart that names no file (a plugin's `server.restart()`) is still that
+/// app's. Set once; later calls are ignored.
+pub fn set_restart_hook(hook: fn(&Path, &str) -> !) {
     let _ = RESTART_HOOK.set(hook);
 }
 

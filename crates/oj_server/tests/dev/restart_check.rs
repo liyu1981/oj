@@ -156,13 +156,9 @@ async fn a_fixed_untracked_input_lets_the_same_config_restart() {
     app.write(&[("data.yaml", "good\n")]);
     server.text("/__restart").await;
     until("the same config restarted", || {
-        // A plugin's restart names no file: claimed here before any
-        // server's drop fails on it.
-        let mut all = crate::RESTARTS.lock().unwrap();
-        let at = all
+        take_restarts_for(&app.root)
             .iter()
-            .position(|r| r == "plugin requested server.restart()");
-        at.map(|at| all.remove(at)).is_some()
+            .any(|r| r == "plugin requested server.restart()")
     })
     .await;
     assert_eq!(restart_failures(&marker).len(), 1, "it failed again");
@@ -256,6 +252,68 @@ export default {{
                 !take_restarts_for(&app.root).is_empty()
             })
             .await;
+        }
+    }
+}
+
+/// A restart no config edit asked for (the start entry appearing or
+/// disappearing) execs without evaluating the config again: the check would
+/// run the framework's plugins while the running server's still react to file
+/// events. Once a check failed, the config on disk may not boot, so it is
+/// checked again first.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchecked_restart_skips_the_check_until_one_failed() {
+    capture_failures();
+    for broken_first in [false, true] {
+        let log_dir = tempfile::tempdir().unwrap();
+        let log = log_dir.path().join("evaluations.log");
+        let config = |extra: &str| {
+            format!(
+                "import fs from \"node:fs\";\nfs.appendFileSync({}, \"evaluated\\n\");\n{extra}export default {{}};\n",
+                js(&log)
+            )
+        };
+        let app = App::new(&[
+            (
+                "package.json",
+                r#"{"name":"restart-unchecked","private":true,"type":"module"}"#,
+            ),
+            ("index.html", INDEX_HTML),
+            ("src/main.js", "window.__ok = 1;\n"),
+            ("vite.config.mjs", &config("")),
+        ]);
+        let server = app.serve().await;
+        let root = app.root.display().to_string();
+        let evaluations = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        if broken_first {
+            app.write(&[("vite.config.mjs", &config("throw new Error(\"broken\");\n"))]);
+            until("the broken edit's check failed", || {
+                restart_failures(&root).len() == 1
+            })
+            .await;
+        }
+        let before = evaluations();
+        // The test hook parks the restarting thread, as the exec would end it.
+        let restarter = std::sync::Arc::clone(&server.built.restarter);
+        std::thread::spawn(move || restarter.request_unchecked("the start entry changed"));
+        if broken_first {
+            until("the flip was checked", || {
+                restart_failures(&root).len() == 2
+            })
+            .await;
+            assert_eq!(take_restarts_for(&app.root), Vec::<String>::new());
+            assert!(server.text("/src/main.js").await.contains("__ok"));
+        } else {
+            until("the unchecked restart", || {
+                take_restarts_for(&app.root) == ["the start entry changed"]
+            })
+            .await;
+            assert_eq!(evaluations(), before, "the config was evaluated again");
         }
     }
 }
