@@ -178,6 +178,8 @@ jobs:
         run: node e2e/plugin-file-hmr.mjs
       - name: client env define (dotenv + process env + plugin config mutations)
         run: node e2e/env-define.mjs
+      - name: a config edit whose plugins fail to resolve keeps the running server, like Vite's restart
+        run: node e2e/config-restart-failure.mjs
       - name: a vite.config that fails to load is an error, not an empty config
         run: node e2e/config-load-failure.mjs
       # These drive a dev server (and svgr-plugin also a browser via playwright),
@@ -221,6 +223,8 @@ jobs:
         run: node e2e/start-config-temp.mjs
       - name: start dev evaluates vite.config only where its plugins run, at boot and restart
         run: node e2e/start-config-once.mjs
+      - name: start dev runs every environment on one set of plugin instances
+        run: node e2e/start-plugin-environments.mjs
       - name: start prod build honors ssr.external (bare imports, server still renders)
         run: node e2e/start-ssr-external.mjs
       - name: start dev SIGTERM sweeps plugin children; detached child outlives
@@ -273,6 +277,10 @@ jobs:
         run: node e2e/start-cloudflare-dev.mjs
       - name: start dev with ssr in workerd leaves client edits to the page's HMR (no rebundle, no reload)
         run: node e2e/start-cloudflare-hmr.mjs
+      - name: start dev for @cloudflare/vite-plugin evaluates vite.config once, one workerd
+        run: node e2e/start-cloudflare-config-once.mjs
+      - name: start dev for @cloudflare/vite-plugin optimizes its setup's deps in a one-shot child
+        run: node e2e/start-cloudflare-preseed.mjs
       - name: experimental.bundledDev is coerced off; the standard dev client entry serves and the page hydrates
         run: node e2e/bundleddev-coerce.mjs
       - name: server.proxy covers the worker's outbound fetch (one proxy in the middleware stack), function rewrite applied

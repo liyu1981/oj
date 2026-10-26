@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 /// The host's own plugin container: the environment it boots in.
 pub(crate) const MAIN_CONTAINER: u32 = 0;
+/// The first id of the containers [`PluginHost::open_environment_container`]
+/// opens; worker containers count up from 1 below it.
+const ENVIRONMENT_CONTAINERS: u32 = 1 << 20;
 
 /// A handle on one plugin container of a plugin host: the host's own
 /// (MAIN_CONTAINER), or a worker bundle's ([`PluginHost::open_worker_container`]).
@@ -24,6 +27,14 @@ pub struct PluginHost {
     /// refetch racing an environment switch) answered for the old plugin set
     /// and must not land.
     hook_plan_epoch: std::sync::atomic::AtomicU64,
+    /// Whether this container's plugins have `watchChange` / `hotUpdate`,
+    /// fetched with the hook plan; true until fetched (an HMR dispatch is
+    /// never skipped by mistake).
+    watch_change: std::sync::atomic::AtomicBool,
+    hot_update: std::sync::atomic::AtomicBool,
+    /// The environment containers declared at spawn (the host's own handle
+    /// only): opened by the host's own init, before its configureServer.
+    declared: std::sync::OnceLock<Vec<(String, std::sync::Arc<PluginHost>)>>,
 }
 
 /// A plugin host's engine and its lifecycle (boot, pushes, revive), shared by
@@ -83,6 +94,11 @@ pub(crate) struct HostCore {
     self_ref: std::sync::OnceLock<std::sync::Weak<HostCore>>,
     /// The handle on the host's own container, whose hook plan a respawn resets.
     main: std::sync::OnceLock<std::sync::Weak<PluginHost>>,
+    /// The environment containers opened on this host, as each boot reopens
+    /// them (their specs ride the boot seed), with the handles whose hook
+    /// plans a respawn resets.
+    pub(crate) environments: Mutex<Vec<(serde_json::Value, std::sync::Weak<PluginHost>)>>,
+    next_environment: std::sync::atomic::AtomicU32,
 }
 
 /// The dev listener's bound (port, interface): hosts booting after the bind
@@ -124,10 +140,15 @@ fn new_host_engine(
 ) -> Result<oj_js::JsEngine, String> {
     let root = root.to_path_buf();
     let resolver = std::sync::Arc::new(OjResolver::new(&root));
+    let preseeds = Preseeds {
+        runtime: tokio::runtime::Handle::try_current().ok(),
+        ..Preseeds::default()
+    };
     let rpc_handler: oj_js::RpcHandler = {
         let root = root.clone();
         Box::new(move |method, args| {
             bundle_rpc(method, args, &bundles)
+                .or_else(|| preseeds.rpc(method, args, &root))
                 .unwrap_or_else(|| ctx_rpc(method, args, &resolver, &root, import_meta_env.get()))
         })
     };
@@ -394,6 +415,67 @@ pub(crate) fn ctx_rpc(
     }
 }
 
+/// The deps pre-seeds of the dev server setup's registrations (plugin-host.mjs
+/// `seedBootRegistrations`): asked for and polled over the synchronous
+/// bridge, which a host still in its top-level init can use (a hook reply
+/// cannot reach it then, and the setup may be what waits on the seed).
+#[derive(Default)]
+struct Preseeds {
+    runs: Arc<std::sync::Mutex<std::collections::HashMap<u64, Option<bool>>>>,
+    next: std::sync::atomic::AtomicU64,
+    /// The runtime the engine was made on: the bridge runs on the isolate's thread.
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Preseeds {
+    /// `preseedRegistered(mode, registrations)` starts one and returns its
+    /// id; `preseedRegisteredDone(id)` is null while it runs, then whether
+    /// the child committed. None for any other method.
+    fn rpc(
+        &self,
+        method: &str,
+        args: &[serde_json::Value],
+        root: &Path,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let arg = |i: usize| {
+            args.get(i)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        match method {
+            "preseedRegistered" => {
+                let Some(runtime) = &self.runtime else {
+                    return Some(Ok(serde_json::Value::Null));
+                };
+                let id = self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                self.runs.lock().unwrap().insert(id, None);
+                let (runs, root, mode, registered) =
+                    (Arc::clone(&self.runs), root.to_path_buf(), arg(0), arg(1));
+                runtime.spawn(async move {
+                    let seeded = crate::preseed::seed_registered(&root, &mode, &registered).await;
+                    runs.lock().unwrap().insert(id, Some(seeded));
+                });
+                Some(Ok(serde_json::json!(id)))
+            }
+            "preseedRegisteredDone" => {
+                let id = args.first().and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+                let mut runs = self.runs.lock().unwrap();
+                Some(Ok(match runs.get(&id) {
+                    Some(Some(seeded)) => {
+                        let seeded = *seeded;
+                        runs.remove(&id);
+                        serde_json::Value::Bool(seeded)
+                    }
+                    Some(None) => serde_json::Value::Null,
+                    None => serde_json::Value::Bool(false),
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The bundle a plugin container's hooks run inside. Its `this.getModuleInfo`
 /// and `this.getModuleIds` read this graph as Rollup's plugin context reads
 /// its own: every module the bundler has met is in it, whether or not a JS
@@ -539,26 +621,6 @@ impl PluginHost {
         .await
     }
 
-    /// Spawn a lazily created host (e.g. the SSR environment host), booted on
-    /// first demand. Its calls wait init out like a boot host's; the watcher
-    /// never waits here at all (pre-init events fast-skip into
-    /// `SsrWatchQueue` for a catch-up replay).
-    pub async fn spawn_lazy(
-        root: &Path,
-        plugins_file: &Path,
-        config_json: &str,
-        registry: Option<oj_js::EngineRegistry>,
-    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_with_policy(
-            root,
-            plugins_file,
-            config_json,
-            SpawnTimeouts::default(),
-            registry,
-        )
-        .await
-    }
-
     /// Test-only spawn with the probe and stall windows explicit (see `SpawnTimeouts`).
     #[cfg(test)]
     pub(crate) async fn spawn_with_timeouts(
@@ -577,16 +639,45 @@ impl PluginHost {
         config_json: &str,
         prewarm: HostPrewarm,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        let registry = prewarm.registry.clone();
+        Self::spawn_dev(root, plugins_file, config_json, None, Some(prewarm), &[]).await
+    }
+
+    /// The dev server's host: on a prewarmed engine when there is one, with
+    /// `environments` (name, leave out the reimplemented framework plugins)
+    /// declared up front, so its own init opens them before its
+    /// configureServer runs, as Vite's createServer creates and inits every
+    /// environment first. [`PluginHost::environment`] hands them out.
+    pub async fn spawn_dev(
+        root: &Path,
+        plugins_file: &Path,
+        config_json: &str,
+        registry: Option<oj_js::EngineRegistry>,
+        prewarm: Option<HostPrewarm>,
+        environments: &[(&str, bool)],
+    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
+        let registry = prewarm
+            .as_ref()
+            .map(|p| p.registry.clone())
+            .unwrap_or(registry);
         Self::spawn_inner(
             root,
             plugins_file,
             config_json,
             SpawnTimeouts::default(),
             registry,
-            Some(prewarm),
+            prewarm,
+            environments,
         )
         .await
+    }
+
+    /// A container [`PluginHost::spawn_dev`] declared.
+    pub fn environment(&self, name: &str) -> Option<std::sync::Arc<PluginHost>> {
+        self.declared
+            .get()?
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| std::sync::Arc::clone(h))
     }
 
     /// The host's engine, started before its config payload exists: the
@@ -633,7 +724,16 @@ impl PluginHost {
         timeouts: SpawnTimeouts,
         registry: Option<oj_js::EngineRegistry>,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_inner(root, plugins_file, config_json, timeouts, registry, None).await
+        Self::spawn_inner(
+            root,
+            plugins_file,
+            config_json,
+            timeouts,
+            registry,
+            None,
+            &[],
+        )
+        .await
     }
 
     async fn spawn_inner(
@@ -643,6 +743,7 @@ impl PluginHost {
         timeouts: SpawnTimeouts,
         registry: Option<oj_js::EngineRegistry>,
         mut prewarm: Option<HostPrewarm>,
+        environments: &[(&str, bool)],
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
         let script = oj_cache::cache_root(root).join("plugin-host.mjs");
 
@@ -695,6 +796,8 @@ impl PluginHost {
             shut_down: std::sync::atomic::AtomicBool::new(false),
             self_ref: std::sync::OnceLock::new(),
             main: std::sync::OnceLock::new(),
+            environments: Mutex::new(Vec::new()),
+            next_environment: std::sync::atomic::AtomicU32::new(ENVIRONMENT_CONTAINERS),
         });
         let _ = core.self_ref.set(std::sync::Arc::downgrade(&core));
         let host = std::sync::Arc::new(PluginHost::over(
@@ -703,6 +806,18 @@ impl PluginHost {
             None,
         ));
         let _ = core.main.set(std::sync::Arc::downgrade(&host));
+        let declared = environments
+            .iter()
+            .map(|(name, leave_out)| {
+                let (spec, handle) = core.declare_environment(name, *leave_out, false);
+                core.environments
+                    .lock()
+                    .unwrap()
+                    .push((spec, std::sync::Arc::downgrade(&handle)));
+                (name.to_string(), handle)
+            })
+            .collect();
+        let _ = host.declared.set(declared);
         LIVE_HOSTS
             .lock()
             .unwrap()
@@ -995,6 +1110,12 @@ impl PluginHost {
         self.call_unit("closeBundle", &[]).await
     }
 
+    /// Vite's environment close: buildEnd, then closeBundle with what
+    /// buildEnd threw (the close fails with it).
+    pub async fn close_environment(&self) -> Result<(), String> {
+        self.call_unit("closeEnvironment", &[]).await
+    }
+
     /// The dev server's `close()`, which plugins wrap to dispose what `configureServer` started.
     pub async fn close_dev_server(&self) -> Result<(), String> {
         self.call_unit("closeDevServer", &[]).await
@@ -1047,11 +1168,11 @@ impl PluginHost {
         self.hook_plan.read().unwrap().clone()
     }
 
-    /// Dispatch the app-Vite-side transform warm (fire-and-forget, like Vite's
-    /// warmup.ts); replies once dispatched. Returns `{environments, started}`, None when nothing was warmable.
-    pub async fn warm_environments(&self, urls: &[String]) -> Result<Option<String>, String> {
-        let payload = serde_json::to_string(urls).map_err(|e| e.to_string())?;
-        self.call("warmEnvironments", &[&payload]).await
+    /// Dispatch the runner environments' `server.warmup` transforms
+    /// (fire-and-forget, like Vite's warmup.ts); replies once dispatched.
+    /// Returns `{environments, started}`, None when nothing was warmable.
+    pub async fn warm_environments(&self) -> Result<Option<String>, String> {
+        self.call("warmEnvironments", &[]).await
     }
 
     async fn ensure_hook_plan(&self) {
@@ -1068,12 +1189,28 @@ impl PluginHost {
                 load: HookFilterPlan::from_json(v.get("load")),
                 resolve_id: HookFilterPlan::from_json(v.get("resolveId")),
             };
+            let flag = |key: &str| v.get(key).and_then(|b| b.as_bool()).unwrap_or(true);
             let mut slot = self.hook_plan.write().unwrap();
             if self.hook_plan_epoch.load(Ordering::Acquire) == epoch {
                 *slot = plan;
+                self.watch_change
+                    .store(flag("watchChange"), Ordering::Release);
+                self.hot_update.store(flag("hotUpdate"), Ordering::Release);
                 self.hook_plan_fetched.store(true, Ordering::Release);
             }
         }
+    }
+
+    /// Whether this container's plugins take `watchChange` (fetched with
+    /// the hook plan, refetched on a revive; true until then).
+    pub fn wants_watch_change(&self) -> bool {
+        self.watch_change.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this container's plugins take `hotUpdate` (see
+    /// [`PluginHost::wants_watch_change`]).
+    pub fn wants_hot_update(&self) -> bool {
+        self.hot_update.load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[inline]
@@ -1247,16 +1384,6 @@ impl PluginHost {
             .unwrap_or_default()
     }
 
-    /// Which HMR hooks any active plugin defines: (watchChange, handleHotUpdate).
-    /// Defaults to (true, true) on failure so an HMR RPC is never skipped by mistake.
-    pub async fn hmr_hooks(&self) -> (bool, bool) {
-        let Some(v) = self.call_json("getHmrHooks").await else {
-            return (true, true);
-        };
-        let flag = |key: &str| v.get(key).and_then(|b| b.as_bool()).unwrap_or(true);
-        (flag("watchChange"), flag("handleHotUpdate"))
-    }
-
     /// Where this container's async reverse RPCs go (each container answers
     /// its own: a worker bundle's `this.resolve` ends in that bundle).
     pub fn set_rpc_request_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<HostRpc>) {
@@ -1372,6 +1499,9 @@ impl PluginHost {
             hook_plan_fetched: std::sync::atomic::AtomicBool::new(false),
             hook_plan_prime_started: std::sync::atomic::AtomicBool::new(false),
             hook_plan_epoch: std::sync::atomic::AtomicU64::new(0),
+            watch_change: std::sync::atomic::AtomicBool::new(true),
+            hot_update: std::sync::atomic::AtomicBool::new(true),
+            declared: std::sync::OnceLock::new(),
         }
     }
 
@@ -1384,7 +1514,7 @@ impl PluginHost {
         let chain = serde_json::to_string(chain).map_err(|e| e.to_string())?;
         let id = self
             .core
-            .call(MAIN_CONTAINER, "openWorkerContainer", &[&chain])
+            .call(self.container, "openWorkerContainer", &[&chain])
             .await?
             .and_then(|id| id.parse::<u32>().ok())
             .ok_or("the plugin host opened no worker container")?;
@@ -1395,12 +1525,86 @@ impl PluginHost {
         Ok(worker)
     }
 
+    /// Another Vite environment on this host's plugin instances (Vite's
+    /// createServer gives every environment a container over the one plugin
+    /// array): `name`'s, with the framework plugins oj reimplements left out
+    /// when `leave_out`, its `this.resolve` ending in a bundle's own
+    /// resolution when `bundle`. One of the host's own environment is that
+    /// environment (one buildStart). A respawned engine reopens it.
+    pub async fn open_environment_container(
+        &self,
+        name: &str,
+        leave_out: bool,
+        bundle: bool,
+    ) -> Result<std::sync::Arc<PluginHost>, String> {
+        let (spec, handle) = self.core.declare_environment(name, leave_out, bundle);
+        let id = handle.container;
+        // Recorded first: a revive racing the open reopens it from the seed.
+        self.core
+            .environments
+            .lock()
+            .unwrap()
+            .push((spec.clone(), std::sync::Arc::downgrade(&handle)));
+        let open = || async {
+            self.core
+                .call(
+                    MAIN_CONTAINER,
+                    "openEnvironmentContainer",
+                    &[&spec.to_string()],
+                )
+                .await
+        };
+        let generation = || self.core.revive.lock().unwrap().generation;
+        let mut tried = generation();
+        let mut opened = open().await;
+        // An engine that died meanwhile comes back with the container (its
+        // seed lists it): a later call revives it, and the open adopts it,
+        // also when another caller revived it first. A revive held back
+        // (respawn spacing, an addon that cannot be re-registered) fails the
+        // call at once, so the retries wait between calls, within a bound.
+        let deadline = tokio::time::Instant::now() + 3 * PLUGIN_HOST_RESPAWN_SPACING;
+        while opened.is_err() && tokio::time::Instant::now() < deadline {
+            if generation() == tried {
+                if !(*self.core.host_gone.borrow() && self.core.can_revive()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            tried = generation();
+            opened = open().await;
+        }
+        if let Err(e) = opened {
+            self.core
+                .environments
+                .lock()
+                .unwrap()
+                .retain(|(s, _)| s["id"] != id);
+            // A live engine that opened it anyway (from a seed) drops it.
+            if !*self.core.host_gone.borrow() {
+                let _ = self.core.call(id, "closeContainer", &["environment"]).await;
+            }
+            return Err(e);
+        }
+        handle.ensure_hook_plan().await;
+        Ok(handle)
+    }
+
+    /// How many plugins the host's config lists before any environment
+    /// drops one (`applyToEnvironment`): a host whose client runs none may
+    /// still run some elsewhere. Defaults to 1 on RPC failure.
+    pub async fn top_level_plugin_count(&self) -> usize {
+        self.call_ok("getTopLevelPluginCount")
+            .await
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    }
+
     /// Drops this handle's worker container from the host (its plugins answer
-    /// no more hooks); the host's own container is never closed.
+    /// no more hooks); the host's own and its environment containers are never closed.
     pub async fn close_container(&self) -> Result<(), String> {
         // A stale handle's container died with its engine, and its id may
         // be a live bundle's now.
-        if self.container == MAIN_CONTAINER || self.is_stale() {
+        if self.generation.is_none() || self.is_stale() {
             return Ok(());
         }
         self.core.rpc_routes.lock().unwrap().remove(&self.container);
@@ -1434,6 +1638,8 @@ impl PluginHost {
         let mut slot = self.hook_plan.write().unwrap();
         self.hook_plan_epoch.fetch_add(1, Ordering::AcqRel);
         *slot = BuildHookPlan::fail_open();
+        self.watch_change.store(true, Ordering::Release);
+        self.hot_update.store(true, Ordering::Release);
         drop(slot);
         self.hook_plan_fetched.store(false, Ordering::Release);
         self.hook_plan_prime_started.store(false, Ordering::Release);
@@ -1509,9 +1715,38 @@ impl PluginHost {
 }
 
 impl HostCore {
+    /// A fresh environment container's spec and handle (not yet recorded).
+    fn declare_environment(
+        self: &std::sync::Arc<Self>,
+        name: &str,
+        leave_out: bool,
+        bundle: bool,
+    ) -> (serde_json::Value, std::sync::Arc<PluginHost>) {
+        let id = self
+            .next_environment
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let spec =
+            serde_json::json!({ "id": id, "name": name, "leaveOut": leave_out, "bundle": bundle });
+        let handle = std::sync::Arc::new(PluginHost::over(std::sync::Arc::clone(self), id, None));
+        (spec, handle)
+    }
+
     /// The host's own container, while a handle on it lives.
     fn main_container(&self) -> Option<std::sync::Arc<PluginHost>> {
         self.main.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// The live handles on the containers every generation re-creates.
+    fn durable_containers(&self) -> Vec<std::sync::Arc<PluginHost>> {
+        let mut out: Vec<_> = self.main_container().into_iter().collect();
+        out.extend(
+            self.environments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, h)| h.upgrade()),
+        );
+        out
     }
 
     /// Boot one engine GENERATION onto `host` (initial spawn and every revive). A
@@ -1621,7 +1856,15 @@ impl HostCore {
         generation: u64,
     ) {
         let host = std::sync::Arc::clone(host);
-        let seed = host.boot.boot_seed.clone();
+        let mut seed = host.boot.boot_seed.clone();
+        seed["containers"] = serde_json::Value::Array(
+            host.environments
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(spec, _)| spec.clone())
+                .collect(),
+        );
         let host_module = host.host_module.clone();
         tokio::spawn(async move {
             let seeded = match ensure_boot_module(&host.boot.root) {
@@ -1876,10 +2119,10 @@ impl HostCore {
             Ok(()) => {
                 // Lift the death flag last: a caller sees a dead host or a fully re-armed one.
                 let _ = self.host_gone.send_replace(false);
-                if let (Ok(handle), Some(main)) =
-                    (tokio::runtime::Handle::try_current(), self.main_container())
-                {
-                    handle.spawn(async move { main.ensure_hook_plan().await });
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    for handle in self.durable_containers() {
+                        runtime.spawn(async move { handle.ensure_hook_plan().await });
+                    }
                 }
                 true
             }
@@ -1905,13 +2148,12 @@ impl HostCore {
         let _ = self.init_failed.send_replace(false);
         self.serve_info_push.send_replace(None);
         // Worker containers died with the old engine, their routes with them;
-        // the host's own refetches.
-        self.rpc_routes
-            .lock()
-            .unwrap()
-            .retain(|&container, _| container == MAIN_CONTAINER);
-        if let Some(main) = self.main_container() {
-            main.reset_hook_plan();
+        // the host's own and its environment containers come back and refetch.
+        self.rpc_routes.lock().unwrap().retain(|&container, _| {
+            container == MAIN_CONTAINER || container >= ENVIRONMENT_CONTAINERS
+        });
+        for handle in self.durable_containers() {
+            handle.reset_hook_plan();
         }
         *self.spawned.lock().unwrap() = tokio::time::Instant::now();
     }

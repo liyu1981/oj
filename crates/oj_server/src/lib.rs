@@ -346,20 +346,19 @@ struct ServerState {
     hmr_enabled: bool,
     /// The files whose change restarts the server ([`restart_files`]).
     restart_files: Vec<PathBuf>,
-    /// The CLI's `--config` file (resolved against root), for the lazily
-    /// spawned SSR host's plugin-source pick.
-    config_file: Option<PathBuf>,
+    restarter: Arc<watch::Restarter>,
     /// The engines the debug GC endpoint fans over (plugin hosts, CSS, SSR,
     /// Start, addon keeper); every long-lived spawn joins it.
     engine_registry: oj_js::EngineRegistry,
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_serve: Arc<PluginServe>,
-    plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
-    /// Watcher events the lazily spawned SSR host could not take yet, plus
-    /// the dispatch-order lock; see [`SsrWatchQueue`].
-    ssr_watch: Arc<SsrWatchQueue>,
-    ssr_plugin_config: String,
+    /// The ssr environment's container on `plugins`, opened at boot as Vite's
+    /// createServer creates every environment before it listens.
+    plugins_ssr: Option<std::sync::Arc<PluginHost>>,
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// The files the ssr pipeline compiled: the ssr environment's module
+    /// graph, which its hotUpdate reads.
+    ssr_modules: Mutex<std::collections::HashSet<PathBuf>>,
     /// Into the watcher thread's inbox (`WatchMsg`): directories of files
     /// served from outside the root (`ensure_watched_file`).
     watch_tx: std::sync::mpsc::Sender<WatchMsg>,
@@ -379,7 +378,6 @@ struct ServerState {
     // A relative or absolute import is offered to plugin `resolveId` before oj's
     // resolver when it matches one of these (object-form resolveId `filter.id`).
     resolve_id_res: Vec<plugins::HookFilter>,
-    plugins_watch_change: bool,
     /// A plugin hooks `transformIndexHtml`: dev pages run the host's transform,
     /// its hooks interleaved with Vite's; otherwise oj's native one (dev_html).
     plugins_have_transform_index_html: bool,
@@ -387,7 +385,6 @@ struct ServerState {
     html_proxy: dev_html::HtmlProxyCache,
     /// `envPrefix`, for the HTML env hook's undefined-variable warning.
     env_prefixes: Vec<String>,
-    plugins_hot_update: bool,
     html_env: std::collections::BTreeMap<String, String>,
     parsed_fired: Mutex<std::collections::HashSet<String>>,
     rt: tokio::runtime::Handle,
@@ -645,6 +642,8 @@ pub struct BuiltApp {
     /// Live plugin-middleware state (port + runner environments), shared with
     /// the router's state; a slow plugin host activates it after boot.
     pub plugin_serve: Arc<PluginServe>,
+    /// This server's restarts, checked before they replace it.
+    pub restarter: Arc<Restarter>,
     pub root: PathBuf,
     pub started: Instant,
     /// Sender for the `/__ws` broadcast: the channel the editor reads
@@ -845,15 +844,8 @@ fn empty_plugin_file(root: &Path) -> Option<PluginFile> {
     })
 }
 
-/// Handed to buildEnvironments and vite.resolveConfig verbatim: the deps
-/// pre-seed child must resolve with the SAME string or cache hashes cannot match.
+/// The dev host's environment mode (Vite's `environment.mode`).
 const HOST_ENV_MODE: &str = "dev";
-
-/// The plugin host spawn payloads for the client and ssr environments.
-struct PluginHostPayloads {
-    client: String,
-    ssr: String,
-}
 
 /// The inline config a Vite CLI run with these flags would carry (cli.ts:
 /// `server: cleanGlobalCLIOptions(options)`): only what was passed.
@@ -871,8 +863,9 @@ fn cli_inline(port: Option<u16>, host: Option<&str>) -> serde_json::Value {
     serde_json::json!({ "server": server })
 }
 
+/// The dev plugin host's spawn payload (its own environment is the client).
 #[allow(clippy::too_many_arguments)]
-fn plugin_host_payloads(
+fn plugin_host_payload(
     root: &Path,
     config: &oj_config::OjConfig,
     server_cfg: &oj_config::ServerConfig,
@@ -881,7 +874,7 @@ fn plugin_host_payloads(
     cli: &serde_json::Value,
     format: PluginsFormat,
     is_start: bool,
-) -> PluginHostPayloads {
+) -> String {
     let mut cfg = serde_json::json!({
         "config": {
             "root": root.display().to_string(),
@@ -919,12 +912,7 @@ fn plugin_host_payloads(
         // falls through to the host's own declaration check; omitted for oj plugin files.
         cfg["runnerBacked"] = serde_json::json!(oj_config::ssr_runner_backed(config));
     }
-    let client = cfg.to_string();
-    cfg["environment"]["name"] = serde_json::json!("ssr");
-    PluginHostPayloads {
-        client,
-        ssr: cfg.to_string(),
-    }
+    cfg.to_string()
 }
 
 /// Spawn the client plugin host. Nothing left after native filtering = an idle
@@ -937,12 +925,22 @@ async fn spawn_plugin_host(
     registry: &oj_js::EngineRegistry,
     prewarm: Option<plugins::HostPrewarm>,
     keep_for_proxy: bool,
+    is_start: bool,
 ) -> anyhow::Result<Option<Arc<PluginHost>>> {
     let label = &file.label;
-    let spawned = match prewarm {
-        Some(warm) => PluginHost::spawn_prewarmed(root, &file.path, payload, warm).await,
-        None => PluginHost::spawn(root, &file.path, payload, Some(registry.clone())).await,
-    };
+    // Vite's createServer creates and inits every environment before its
+    // configureServer hooks run, the ssr one included: the host's own init
+    // opens the ssr container (the framework plugins oj reimplements left out
+    // under Start).
+    let spawned = PluginHost::spawn_dev(
+        root,
+        &file.path,
+        payload,
+        Some(registry.clone()),
+        prewarm,
+        &[("ssr", is_start)],
+    )
+    .await;
     let host = match spawned {
         Ok(host) => host,
         Err(e) => {
@@ -950,9 +948,17 @@ async fn spawn_plugin_host(
             return Ok(None);
         }
     };
-    // With no plugin active, the dev HTML transform runs natively and the
-    // host goes, unless it hosts `server.proxy`.
-    if host.plugin_count().await == 0 {
+    let count = host.plugin_count().await;
+    // A plugin that fails the host's init (a throwing config hook, an
+    // environment it cannot apply to) fails the boot, as it fails Vite's
+    // createServer: never a server running without the app's plugins.
+    if *host.host_gone_updates().borrow() {
+        host.shutdown();
+        anyhow::bail!("the plugin host failed to initialize (see the error above)");
+    }
+    // With no plugin active in any environment, the dev HTML transform runs
+    // natively and the host goes, unless it hosts `server.proxy`.
+    if count == 0 && host.top_level_plugin_count().await == 0 {
         if keep_for_proxy {
             println!("  plugins: {label} (none active; host kept for server.proxy)");
             return Ok(Some(host));
@@ -998,8 +1004,6 @@ struct PluginCaps {
     dep_transform_res: Vec<plugins::HookFilter>,
     dep_load_res: Vec<plugins::HookFilter>,
     resolve_id_res: Vec<plugins::HookFilter>,
-    watch_change: bool,
-    hot_update: bool,
     have_transform_index_html: bool,
 }
 
@@ -1015,7 +1019,6 @@ impl PluginCaps {
         // Prime the per-plugin filter plan (hook_wants_* gates read it live): a filtered
         // hook's RPC is skipped for app modules its filter can never claim.
         let _ = host.build_hook_plan().await;
-        let (watch_change, hot_update) = host.hmr_hooks().await;
         let have_transform_index_html = host.has_transform_index_html().await;
         PluginCaps {
             use_module_parsed,
@@ -1025,8 +1028,6 @@ impl PluginCaps {
             dep_transform_res,
             dep_load_res,
             resolve_id_res,
-            watch_change,
-            hot_update,
             have_transform_index_html,
         }
     }
@@ -1482,6 +1483,16 @@ impl DevServer {
     }
 
     pub async fn build_app(self) -> anyhow::Result<BuiltApp> {
+        self.build_app_with(|_| {}).await
+    }
+
+    /// [`DevServer::build_app`], handing `on_plugin_host` the plugin host the
+    /// moment it is up (`None` when the app runs none), before the rest of the
+    /// build: other environments open their containers on it meanwhile.
+    pub async fn build_app_with(
+        self,
+        on_plugin_host: impl FnOnce(Option<Arc<PluginHost>>) + Send,
+    ) -> anyhow::Result<BuiltApp> {
         let root = self
             .root
             .canonicalize()
@@ -1584,7 +1595,7 @@ impl DevServer {
         // TanStack Start owns its module graph and SSR; oj runs the plugin host only
         // for configureServer middleware, in start mode so lifecycle hooks are tolerated.
         let is_start = is_tanstack_start_app(&root);
-        let payloads = plugin_host_payloads(
+        let payload = plugin_host_payload(
             &root,
             &config,
             &server_cfg,
@@ -1602,7 +1613,7 @@ impl DevServer {
             .is_some_and(|f| f.format == PluginsFormat::Vite)
             && oj_config::ssr_runner_backed(&config)
         {
-            preseed::preseed_server_deps(&root, HOST_ENV_MODE).await;
+            preseed::preseed_server_deps(&root, &dev_mode).await;
         }
         boot_phase("plugin host spawning");
         let plugin_host = match &plugin_file {
@@ -1610,16 +1621,18 @@ impl DevServer {
                 spawn_plugin_host(
                     &root,
                     file,
-                    &payloads.client,
+                    &payload,
                     &engine_registry,
                     prewarm,
                     has_proxy,
+                    is_start,
                 )
                 .await?
             }
             None => None,
         };
         boot_phase("plugin host ready");
+        on_plugin_host(plugin_host.clone());
         let plugin_names = match &plugin_host {
             Some(host) => host.plugin_names().await,
             None => Vec::new(),
@@ -1663,6 +1676,27 @@ impl DevServer {
                 }
             }
             caps = PluginCaps::probe(host).await;
+        }
+        // What a restart of this server boots from, checked before it replaces it.
+        let restarter = Arc::new(watch::Restarter::new(
+            root.clone(),
+            config_file.clone(),
+            dev_mode.clone(),
+            is_start,
+        ));
+        // The ssr container the host's init opened, its
+        // `environments.ssr.define` (and config()-hook deltas) layered over
+        // the shared define for SSR compiles.
+        let plugins_ssr = plugin_host
+            .as_ref()
+            .and_then(|host| host.environment("ssr"));
+        if let Some(ssr) = &plugins_ssr {
+            ssr.build_hook_plan().await;
+            let ssr_defines = ssr.config_defines().await;
+            if !ssr_defines.is_empty() {
+                import_meta_env.merge_ssr(ssr_defines);
+            }
+            boot_phase("ssr environment open");
         }
 
         let jsx = jsx_config_of(&config);
@@ -1720,7 +1754,6 @@ impl DevServer {
         }
         let state = Arc::new(ServerState {
             persistent_cache,
-            config_file: config_file.clone(),
             engine_registry: engine_registry.clone(),
             root: root.clone(),
             public_dir,
@@ -1786,12 +1819,12 @@ impl DevServer {
                 .unwrap_or(0),
             hmr_enabled: hmr.enabled,
             restart_files: restart_files(&root, &env_dir, &dev_mode, config_file.as_deref()),
+            restarter: Arc::clone(&restarter),
             plugins: plugin_host.clone(),
             plugin_serve: Arc::clone(&plugin_serve),
-            plugins_ssr: tokio::sync::OnceCell::new(),
-            ssr_watch: Arc::new(SsrWatchQueue::default()),
-            ssr_plugin_config: payloads.ssr,
+            plugins_ssr,
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            ssr_modules: Mutex::default(),
             watch_tx: watch_tx.clone(),
             watch_feed: WatchFeed::default(),
             plugins_use_module_parsed: caps.use_module_parsed,
@@ -1801,11 +1834,9 @@ impl DevServer {
             dep_transform_res: caps.dep_transform_res,
             dep_load_res: caps.dep_load_res,
             resolve_id_res: caps.resolve_id_res,
-            plugins_watch_change: caps.watch_change,
             plugins_have_transform_index_html: caps.have_transform_index_html,
             html_proxy: Default::default(),
             env_prefixes: oj_config::env_prefixes(&config),
-            plugins_hot_update: caps.hot_update,
             html_env: installed.html_env,
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
@@ -1892,6 +1923,7 @@ impl DevServer {
             strict_port,
             proxy_prefixes,
             plugin_serve,
+            restarter,
             root,
             started,
             reload_tx,
@@ -2001,11 +2033,21 @@ pub async fn close_plugins(host: &PluginHost) {
     if let Err(e) = host.close_dev_server().await {
         eprintln!("oj: dev server close on shutdown failed: {e}");
     }
-    if let Err(e) = host.build_end(None).await {
-        eprintln!("oj: plugin buildEnd on close failed: {e}");
-    }
-    if let Err(e) = host.close_bundle().await {
-        eprintln!("oj: plugin closeBundle on close failed: {e}");
+    // Vite closes every environment's container at once (allSettled):
+    // buildEnd by buildStart's rule (the ssr one only for the plugins that
+    // start per environment), then closeBundle for all, handed buildEnd's error.
+    let ssr = host.environment("ssr");
+    tokio::join!(
+        close_environment("client", Some(host)),
+        close_environment("ssr", ssr.as_deref())
+    );
+}
+
+async fn close_environment(env: &str, container: Option<&PluginHost>) {
+    if let Some(container) = container {
+        if let Err(e) = container.close_environment().await {
+            eprintln!("oj: plugin close ({env}) failed: {e}");
+        }
     }
 }
 

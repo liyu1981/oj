@@ -27,7 +27,7 @@ import {
   flattenPlugins,
   isReimplemented,
 } from "./native-plugins.mjs";
-import { idFilterGlob, idFilterRegExp, loadViteGlobs } from "./start/vite-globs.mjs";
+import { idFilterGlob, idFilterRegExp, loadViteGlobs, viteGlobs } from "./start/vite-globs.mjs";
 import {
   applyHtmlTransforms,
   createHtmlProxy,
@@ -274,18 +274,18 @@ process.on("unhandledRejection", (e) => {
 // themselves, so their config lifecycle hooks are tolerated per-plugin instead
 // of aborting the load, keeping the editor middleware (dev-server bridge) alive.
 const ojStartMode = initial.ojStartMode === true;
-// A Start bundle host backs one of oj's native Start bundles (the client
-// bundle in dev, the client/server/worker bundles of a build): the bundler is
-// rolldown in Rust, which drives this host's hooks, and a plugin's
+// A Start bundle host backs the bundles of a Start build (client, server,
+// workers; the dev client bundle is a container of the dev server's host):
+// the bundler is rolldown in Rust, which drives this host's hooks, and a plugin's
 // `this.resolve` that no plugin answers ends in that bundler's resolution
 // (the `bundlerResolve` reverse RPC), as it ends in Rollup's under Vite.
 const ojBundleHost = initial.ojBundleHost === true;
-// In start mode the ssr-environment host backs oj's in-process Start module
-// host: framework plugins oj reimplements natively (vite:*, tanstack's
-// compiler plugins) must not transform SSR modules — the Start pipeline does
-// their work (server-fn rewrite, route tree, refresh) — while user plugins
-// (mdx, svgr, virtual modules) run. A Start bundle host leaves the same
-// plugins out: the native Start bundles do their work.
+// In start mode framework plugins oj reimplements natively (vite:*,
+// tanstack's compiler plugins) must not transform SSR modules or a native
+// Start bundle's — the Start pipeline does their work (server-fn rewrite,
+// route tree, refresh) — while user plugins (mdx, svgr, virtual modules)
+// run. A host of its own for either leaves them out; so does a container
+// opened for either on the dev server's host (openEnvironmentContainer).
 const startLeavesOutReimplemented = ojStartMode && (hostEnvName === "ssr" || ojBundleHost);
 
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
@@ -725,62 +725,66 @@ environment.config.consumer = environment.config.consumer ?? (hostEnvName === "c
 // fires the capture hook and populates the cache on demand, as Vite does. Only
 // the capture hook matches the `?tss-server-fn-lookup` id (the compiler's own
 // transform excludes it), so there is no recompile or recursion here.
-environment.transformRequest = async (rawId) => {
-  const id = String(rawId ?? "");
-  if (!id) return null;
-  const qIdx = id.indexOf("?");
-  const bareId = qIdx === -1 ? id : id.slice(0, qIdx);
-  const query = qIdx === -1 ? "" : id.slice(qIdx);
-  // Vite's transformRequest is resolve -> load -> transform (doTransform). Mirror
-  // it: (1) the plugin `load` chain serves virtual/plugin-served ids (a `\0`
-  // module) and (2) the file backs an absolute path, a `/@fs/` url, or a
-  // root-relative url (Vite's asSrc). (3) A bare/relative specifier or a url that
-  // neither serves nor exists is RESOLVED like Vite and re-entered. An id that
-  // already loads or is an on-disk file is used as-is, so an already-resolved id
-  // -- what TanStack passes, and the key its getModuleInfo looks up -- is never
-  // rewritten.
-  let source = null;
-  const loaded = await loadFull(main, bareId);
-  if (loaded && loaded.code != null) {
-    source = loaded.code;
-  } else {
-    const root = main.resolvedConfig?.root ?? environment.config?.root ?? process.cwd();
-    // `/foo` is both a valid absolute fs path and a Vite root-relative url, so
-    // probe a real absolute file (TanStack passes bare `p.display()` paths)
-    // BEFORE treating a leading `/` as root-relative (Vite's asSrc).
-    let filePath = null;
-    if (bareId.startsWith("/@fs/")) {
-      const p = bareId.slice(4);
-      if (existsSync(p)) filePath = p;
-    } else if (isAbsolute(bareId) && existsSync(bareId)) {
-      filePath = bareId;
-    } else if (bareId.startsWith("/")) {
-      const p = pathResolve(root, "." + bareId);
-      if (existsSync(p)) filePath = p;
-    }
-    if (filePath) {
-      try {
-        source = readFileSync(filePath, "utf8");
-      } catch {
+function transformRequestFor(c) {
+  const transformRequest = async (rawId) => {
+    const id = String(rawId ?? "");
+    if (!id) return null;
+    const qIdx = id.indexOf("?");
+    const bareId = qIdx === -1 ? id : id.slice(0, qIdx);
+    const query = qIdx === -1 ? "" : id.slice(qIdx);
+    // Vite's transformRequest is resolve -> load -> transform (doTransform). Mirror
+    // it: (1) the plugin `load` chain serves virtual/plugin-served ids (a `\0`
+    // module) and (2) the file backs an absolute path, a `/@fs/` url, or a
+    // root-relative url (Vite's asSrc). (3) A bare/relative specifier or a url that
+    // neither serves nor exists is RESOLVED like Vite and re-entered. An id that
+    // already loads or is an on-disk file is used as-is, so an already-resolved id
+    // -- what TanStack passes, and the key its getModuleInfo looks up -- is never
+    // rewritten.
+    let source = null;
+    const loaded = await loadFull(c, bareId);
+    if (loaded && loaded.code != null) {
+      source = loaded.code;
+    } else {
+      const root = c.resolvedConfig?.root ?? c.environment.config?.root ?? process.cwd();
+      // `/foo` is both a valid absolute fs path and a Vite root-relative url, so
+      // probe a real absolute file (TanStack passes bare `p.display()` paths)
+      // BEFORE treating a leading `/` as root-relative (Vite's asSrc).
+      let filePath = null;
+      if (bareId.startsWith("/@fs/")) {
+        const p = bareId.slice(4);
+        if (existsSync(p)) filePath = p;
+      } else if (isAbsolute(bareId) && existsSync(bareId)) {
+        filePath = bareId;
+      } else if (bareId.startsWith("/")) {
+        const p = pathResolve(root, "." + bareId);
+        if (existsSync(p)) filePath = p;
+      }
+      if (filePath) {
+        try {
+          source = readFileSync(filePath, "utf8");
+        } catch {
+          return null;
+        }
+      } else {
+        // Not loadable and not on disk: resolve it like Vite, then re-enter with
+        // the resolved id (`ctx.resolve` runs the plugin chain then oj's resolver).
+        const r = await contextOf(c).resolve(bareId, undefined);
+        if (r && r.id && r.id !== bareId) return transformRequest(r.id + query);
         return null;
       }
-    } else {
-      // Not loadable and not on disk: resolve it like Vite, then re-enter with
-      // the resolved id (`ctx.resolve` runs the plugin chain then oj's resolver).
-      const r = await contextOf(main).resolve(bareId, undefined);
-      if (r && r.id && r.id !== bareId) return environment.transformRequest(r.id + query);
-      return null;
     }
-  }
-  const out = JSON.parse(await transform(main, source, bareId + query, null));
-  return { code: out.code };
-};
+    const out = JSON.parse(await transform(c, source, bareId + query, null));
+    return { code: out.code };
+  };
+  return transformRequest;
+}
 // The host's own plugin container, over the environment above. Its resolved
 // config (defaults + plugin `config` hooks) is what configureServer receives,
 // not the raw initial.config, so plugins reading resolved-only fields
 // (experimental, environments, plugins) don't throw; it is seeded with the
 // resolved environment config until runConfigHooks recomputes it.
 const main = createContainer(0, environment, environment.config);
+environment.transformRequest = transformRequestFor(main);
 
 // When the app has Vite installed and its config is a vite.config, ask that Vite
 // to resolve the user's config once and use the result as the base the plugins
@@ -792,18 +796,25 @@ const main = createContainer(0, environment, environment.config);
 // runConfigHooks to replay (the later config-phase hooks run only in the
 // host). Without Vite the synthesized defaults stand.
 let userResolvedViteConfig = null;
-// What each hosted plugin's config hook returned inside Vite's resolve.
+// What each hosted plugin's config hook did inside Vite's resolve.
 const recordedConfigPartials = new Map();
-async function loadUserResolvedViteConfig() {
+// What each plugin's configEnvironment hook did, by environment.
+const recordedEnvironmentPartials = new Map();
+// The app's Vite, for a resolve over the user's config.
+async function appViteForResolve() {
   if (initial.pluginsFormat !== "vite" || !userViteConfig) return null;
-  const appRoot = initial.config?.root ?? process.cwd();
-  let vite;
   try {
-    vite = await import(appViteEntry(appRoot));
+    const vite = await import(appViteEntry(initial.config?.root ?? process.cwd()));
+    return typeof vite.resolveConfig === "function" ? vite : null;
   } catch {
     return null;
   }
-  if (typeof vite.resolveConfig !== "function") return null;
+}
+// The recording resolve: the config hooks run once, on the host's own
+// instances, under Vite, each recorded for the host to replay.
+async function loadUserResolvedViteConfig() {
+  const vite = await appViteForResolve();
+  if (!vite) return null;
   // A Start SSR or bundle host resolves without the framework plugins oj
   // reimplements, as it runs without them: their config hooks (the router
   // generator's among them) do work oj's own pipeline does.
@@ -814,7 +825,7 @@ async function loadUserResolvedViteConfig() {
   // (a sibling may wrap one); Vite reads them only after, by when they hide.
   const phase = { hidden: false };
   const plugins = candidates.map((p) => {
-    if (!hosted.has(p)) return p;
+    if (!hosted.has(p)) return recordingConfig(p);
     const restore = recordInPlace(p, phase);
     if (!restore) return recordingPlugin(p);
     restores.push(restore);
@@ -847,7 +858,26 @@ async function loadUserResolvedViteConfig() {
       },
     },
   });
-  const merge = typeof vite.mergeConfig === "function" ? vite.mergeConfig : mergeConfigLite;
+  try {
+    return await viteResolve(vite, inlineMerge(vite)(fileConfig, cliInlineConfig()), plugins);
+  } finally {
+    for (const restore of restores) {
+      try {
+        restore();
+      } catch {}
+    }
+  }
+}
+// A replay resolve: the app's Vite over `plugins`, each answering what its
+// hooks did the first time, under the same inline config.
+async function resolveUserViteConfig(plugins) {
+  const vite = await appViteForResolve();
+  if (!vite) return null;
+  return viteResolve(vite, inlineMerge(vite)(plainCopy(userViteConfig), cliInlineConfig()), plugins);
+}
+const inlineMerge = (vite) => (typeof vite.mergeConfig === "function" ? vite.mergeConfig : mergeConfigLite);
+async function viteResolve(vite, base, plugins) {
+  const appRoot = initial.config?.root ?? process.cwd();
   try {
     // Vite's own NODE_ENV handling runs inside resolveConfig; hand it the
     // command-based defaultNodeEnv (never the mode) and lift oj's untouched
@@ -855,14 +885,7 @@ async function loadUserResolvedViteConfig() {
     unsetOjNodeEnvForResolve();
     const rc = await asNode(() =>
       vite.resolveConfig(
-        {
-          ...merge(fileConfig, cliInlineConfig()),
-          plugins,
-          root: appRoot,
-          configFile: false,
-          mode: env.mode,
-          logLevel: "silent",
-        },
+        { ...base, plugins, root: appRoot, configFile: false, mode: env.mode, logLevel: "silent" },
         env.command,
         env.mode,
         defaultNodeEnv,
@@ -880,11 +903,6 @@ async function loadUserResolvedViteConfig() {
     );
     return null;
   } finally {
-    for (const restore of restores) {
-      try {
-        restore();
-      } catch {}
-    }
     // A throwing resolveConfig may leave the unset behind; the fallback paths
     // below still evaluate config/plugin code that must see a value.
     if (!process.env.NODE_ENV) process.env.NODE_ENV = defaultNodeEnv;
@@ -907,27 +925,158 @@ function withoutCliInline(o) {
   for (const k of Object.keys(cliServer)) delete kept[k];
   return { ...o, server: kept };
 }
-// The hooks `p` shows Vite's resolve: its config hook recorded (what it
-// returned, or threw, for runConfigHook to replay), its configEnvironment,
-// configResolved and applyToEnvironment hidden, left to the host, which runs
-// them on its own resolved config.
+// The resolve's stand-ins, by the plugin each stands in for.
+const standInFor = new WeakMap();
+// `p` with its config hook in place of `config` (and `hidden` over the rest).
+function withConfigHook(p, handler, hidden) {
+  const hook = p.config;
+  const fields = { ...hidden };
+  if (hookFn(p, "config")) fields.config = { value: typeof hook === "function" ? handler : { ...hook, handler } };
+  const standIn = Object.create(p, fields);
+  standInFor.set(standIn, p);
+  return standIn;
+}
+// What a config-phase hook did: the partial it returned, and its in-place
+// edits of the object it was handed (Vite honors both: runConfigHook merges
+// the partial into that very object).
+function hookRecord(before, after, returned) {
+  return { partial: returned === after ? null : plainCopy(returned), edits: editsOf(before, after) };
+}
+const DELETED = Symbol("deleted");
+function isPlainData(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+function sameValue(a, b) {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => sameValue(x, b[i]));
+  if (isPlainData(a) && isPlainData(b)) {
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((k) => k in b && sameValue(a[k], b[k]));
+  }
+  return false;
+}
+// An in-place array edit that kept what the hook saw, in order, between new
+// items: replayed around the replay's own array, so items another plugin put
+// there earlier (one the replay leaves out) stay out.
+class Wrapped {
+  constructor(head, tail) {
+    this.head = head;
+    this.tail = tail;
+  }
+}
+function arrayEdit(before, after) {
+  for (let at = 0; at + before.length <= after.length; at++) {
+    if (before.every((x, i) => sameValue(x, after[at + i]))) {
+      return new Wrapped(plainCopy(after.slice(0, at)), plainCopy(after.slice(at + before.length)));
+    }
+  }
+  return plainCopy(after);
+}
+// The edits that turn `before` (a plainCopy) into `after`, as [path, value]
+// pairs (DELETED for a removed key). The plugin array is the resolve's own.
+function editsOf(before, after, path = [], out = []) {
+  if (!isPlainData(after)) return out;
+  const had = isPlainData(before) ? before : {};
+  for (const key of Object.keys(after)) {
+    if (path.length === 0 && key === "plugins") continue;
+    const a = had[key];
+    const b = after[key];
+    if (isPlainData(a) && isPlainData(b)) editsOf(a, b, [...path, key], out);
+    else if (Array.isArray(a) && Array.isArray(b)) {
+      if (!sameValue(a, b)) out.push([[...path, key], arrayEdit(a, b)]);
+    } else if (!(key in had) || !sameValue(a, b)) out.push([[...path, key], plainCopy(b)]);
+  }
+  for (const key of Object.keys(had)) {
+    if (!(key in after) && !(path.length === 0 && key === "plugins")) out.push([[...path, key], DELETED]);
+  }
+  return out;
+}
+function applyEdits(target, edits) {
+  // One array reached under two names (Vite aliases build.rollupOptions to
+  // rolldownOptions) carries the edit under both: it is made once.
+  const wrapped = new Map();
+  for (const [path, value] of edits ?? []) {
+    let at = target;
+    for (const key of path.slice(0, -1)) {
+      if (!isPlainData(at[key])) at[key] = {};
+      at = at[key];
+    }
+    const last = path[path.length - 1];
+    if (value === DELETED) delete at[last];
+    else if (value instanceof Wrapped) {
+      const own = Array.isArray(at[last]) ? at[last] : [];
+      if (!wrapped.has(own)) {
+        const out = [...plainCopy(value.head), ...own, ...plainCopy(value.tail)];
+        wrapped.set(own, out).set(out, out);
+      }
+      at[last] = wrapped.get(own);
+    } else at[last] = plainCopy(value);
+  }
+  return target;
+}
+// The edits as a partial (what they set), for what the plugins contributed.
+const editsPartial = (edits) =>
+  applyEdits(
+    {},
+    (edits ?? []).filter(([, v]) => v !== DELETED),
+  );
+const hostRunHooks = {
+  configEnvironment: { value: undefined },
+  configResolved: { value: undefined },
+  applyToEnvironment: { value: undefined },
+};
+// What `p`'s configEnvironment hook did for each environment.
+function environmentPartials(p) {
+  if (!recordedEnvironmentPartials.has(p)) recordedEnvironmentPartials.set(p, new Map());
+  return recordedEnvironmentPartials.get(p);
+}
+// `p`'s config hook, recording what it did (its failure too: a hook runs
+// once, and the host takes its failure as it took its answer).
+function recordingConfigHook(p, fn) {
+  return async function (config, configEnv) {
+    const before = plainCopy(config);
+    let partial;
+    try {
+      partial = await fn.call(this, config, configEnv);
+    } catch (e) {
+      recordedConfigPartials.set(p, { ...hookRecord(before, config, null), threw: e });
+      throw e;
+    }
+    recordedConfigPartials.set(p, hookRecord(before, config, partial));
+    return partial;
+  };
+}
+// The hooks `p` shows Vite's resolve: its config and configEnvironment hooks
+// recorded (the host replays their answers, and the environments Vite
+// resolves carry them), its configResolved and applyToEnvironment hidden,
+// left to the host, which runs them on its own resolved config.
 function resolveHooks(p) {
   const hook = p.config;
   const fn = hookFn(p, "config");
-  const record = async function (config, configEnv) {
+  const record = recordingConfigHook(p, fn);
+  const envHook = p.configEnvironment;
+  const envFn = hookFn(p, "configEnvironment");
+  const recordEnvironment = async function (name, options, configEnv) {
+    const before = plainCopy(options);
+    let r;
     try {
-      const partial = await fn.call(this, config, configEnv);
-      // Returning the config itself is an in-place edit, already in the base.
-      recordedConfigPartials.set(p, { partial: partial === config ? null : plainCopy(partial) });
-      return partial;
-    } catch (error) {
-      recordedConfigPartials.set(p, { error });
-      throw error;
+      r = await envFn.call(this, name, options, configEnv);
+    } catch (e) {
+      environmentPartials(p).set(name, { ...hookRecord(before, options, null), threw: e });
+      throw e;
     }
+    environmentPartials(p).set(name, hookRecord(before, options, r));
+    return r;
   };
   return {
     config: fn ? (typeof hook === "function" ? record : { ...hook, handler: record }) : undefined,
-    configEnvironment: undefined,
+    configEnvironment: envFn
+      ? typeof envHook === "function"
+        ? recordEnvironment
+        : { ...envHook, handler: recordEnvironment }
+      : undefined,
     configResolved: undefined,
     applyToEnvironment: undefined,
   };
@@ -990,7 +1139,37 @@ function recordInPlace(p, phase) {
 // cannot take them in place (frozen: no sibling can wrap its hooks either).
 function recordingPlugin(p) {
   const hooks = resolveHooks(p);
-  return Object.create(p, Object.fromEntries(Object.entries(hooks).map(([k, value]) => [k, { value }])));
+  const standIn = Object.create(p, Object.fromEntries(Object.entries(hooks).map(([k, value]) => [k, { value }])));
+  standInFor.set(standIn, p);
+  return standIn;
+}
+// A plugin the host does not run (one oj does natively), its config hook
+// recorded and the rest left to Vite.
+function recordingConfig(p) {
+  const fn = hookFn(p, "config");
+  if (!fn) return p;
+  return withConfigHook(p, recordingConfigHook(p, fn));
+}
+// `p` answering its config hook with what it did the first time, for a
+// resolve that must not run any hook twice; with `environments` its
+// configEnvironment answers too.
+function replayingPlugin(p, environments = false) {
+  const hidden = { ...hostRunHooks };
+  if (environments && hookFn(p, "configEnvironment")) {
+    const replay = (name, options) => {
+      const record = recordedEnvironmentPartials.get(p)?.get(name);
+      applyEdits(options, record?.edits);
+      return record?.partial ?? null;
+    };
+    const hook = p.configEnvironment;
+    hidden.configEnvironment = { value: typeof hook === "function" ? replay : { ...hook, handler: replay } };
+  }
+  const replay = (config) => {
+    const record = recordedConfigPartials.get(p);
+    applyEdits(config, record?.edits);
+    return record?.partial ?? null;
+  };
+  return withConfigHook(p, replay, hidden);
 }
 // A copy of `v`'s plain data (object literals and arrays); functions, RegExps
 // and class instances are kept by reference, and so are the plugins of a
@@ -1377,8 +1556,8 @@ const unsupportedReported = new Set();
 // Vite's filterPlugin, `apply({ ...config, mode }, configEnv)` where config is
 // the user's loaded config file merged with the inline config (oj's values,
 // root, base, define and server, overlay the file's).
-function hostedPlugins(list, userConfig) {
-  let out = list.filter((p) => !ojRunsNatively(p));
+function hostedPlugins(list, userConfig, c = main) {
+  let out = list.filter((p) => !ojRunsNatively(p, c));
   out = out.filter((p) => {
     if (OJ_UNSUPPORTED_PLUGIN_NAMES.has(p && p.name)) {
       if (unsupportedReported.has(p.name)) return false;
@@ -1406,9 +1585,9 @@ function hostedPlugins(list, userConfig) {
 }
 // Whether oj does `p`'s work itself, so this host leaves it out: the
 // top-level list and what applyToEnvironment returns alike.
-function ojRunsNatively(p) {
+function ojRunsNatively(p, c = main) {
   const name = p && p.name;
-  return OJ_NATIVE_PLUGIN_NAMES.has(name) || (startLeavesOutReimplemented && isReimplemented(name));
+  return OJ_NATIVE_PLUGIN_NAMES.has(name) || (c.leaveOut && isReimplemented(name));
 }
 // Vite's picomatch, for plugin `filter` ids.
 await loadViteGlobs(initial.config?.root ?? process.cwd());
@@ -1540,6 +1719,23 @@ function createContainer(id, environment, resolvedConfig) {
     oxcStripFilter: undefined,
     ctx: null,
     pluginCtxs: new WeakMap(),
+    // Whether the framework plugins oj reimplements are left out (a Start
+    // SSR or bundle container), and whether a native bundle drives the hooks.
+    leaveOut: startLeavesOutReimplemented,
+    bundle: ojBundleHost,
+    // The config oj reads its own values from (facts, defines), when it
+    // differs from the one the plugins see: a container that leaves plugins
+    // out reads the config those plugins would not have shaped.
+    ojConfig: null,
+    configDelta: null,
+    hookedConfig: null,
+    // A container of the same environment as another (a Start bundle beside
+    // the dev server's client): one buildStart for the environment.
+    buildStartOwner: null,
+    // A non-client dev environment: its buildStart waits for the client's
+    // and runs only the plugins that ask for it (Vite's
+    // perEnvironmentStartEndDuringDev).
+    startAfter: null,
   };
 }
 const containers = new Map([[0, main]]);
@@ -1727,7 +1923,7 @@ function pluginContext(c) {
         const id = map.get(source);
         return id == null ? null : { id };
       }
-      if (ojBundleHost) {
+      if (c.bundle) {
         const r = await asyncRpc("bundlerResolve", [source, importer ?? "", !!(options && options.isEntry)], c.id);
         // Outside a running bundle (no bundler to ask) oj's resolver answers.
         if (!r || !r.fallback) return r ?? null;
@@ -1897,17 +2093,34 @@ let hookedUserConfig = {};
 // `onPartial` sees each plugin's contribution; `keepPlugins` pins the plugin
 // array across the merges (mergeConfigLite concatenates arrays). A skipped
 // hook marks `container`.
-async function runConfigHook(config, list, { onPartial, keepPlugins, container = main, recorded } = {}) {
+async function runConfigHook(
+  config,
+  list,
+  { onPartial, keepPlugins, container = main, recorded, replay, rebase = replay } = {},
+) {
   const configContext = minimalContext();
   for (const { p, fn } of hooksOf(list, "config")) {
     initStage(`config:${p.name ?? "?"}`);
     try {
-      const rec = recorded?.get(p);
-      if (rec?.error) throw rec.error;
-      const partial = rec ? rec.partial : await fn.call(configContext, config, env);
-      if (partial) {
-        config = mergeConfigLite(config, partial);
-        onPartial?.(partial);
+      let record = recorded?.get(p);
+      // What a hook did inside the resolve the base came from (edits and the
+      // partial both) is already in it; over any other base (no resolve, or
+      // one that failed) it is made again, once.
+      const inBase = !!record && !rebase;
+      if (record) {
+        if (rebase) applyEdits(config, record.edits);
+        if (record.threw) throw record.threw;
+      } else if (!replay) {
+        const before = plainCopy(config);
+        const partial = await fn.call(configContext, config, env);
+        record = hookRecord(before, config, partial);
+        if (recorded) recorded.set(p, record);
+      }
+      if (record?.edits.length) onPartial?.(editsPartial(record.edits));
+      if (record?.partial) {
+        // A copy: later hooks edit the merged config in place.
+        if (!inBase) config = mergeConfigLite(config, plainCopy(record.partial));
+        onPartial?.(record.partial);
       }
     } catch (e) {
       if (!ojStartMode) throw e;
@@ -1932,15 +2145,23 @@ async function runConfigResolved(list, resolved, container = main) {
     }
   }
 }
-async function runConfigHooks() {
-  userResolvedViteConfig = await loadUserResolvedViteConfig();
-  initStage("user-config-resolved");
-  let config = initial.config ?? {};
-  if (userResolvedViteConfig) {
+// Vite's resolveConfig over `rc` (the app's Vite resolve, or null) for the
+// plugins of `list`: their config hooks, then every environment's
+// configEnvironment, as `{ config, resolved, delta }` (the config before
+// defaults, the resolved one, what the plugins contributed). With `replay`
+// each hook answers what it returned the first time: a container leaving
+// plugins out reads the config the rest made, and no hook runs twice.
+async function hostConfig(rc, list, { replay = false, container = main } = {}) {
+  // Whether the base is not a resolve the recorded hooks ran in (the app's,
+  // or a replay of their answers).
+  const rebase = !rc;
+  // A copy: the hooks edit it in place, and every hostConfig starts from it.
+  let config = plainCopy(initial.config ?? {});
+  if (rc) {
     // The user's resolved config is the base; oj's own values (root, define,
     // server, environments) overlay it, but for the CLI-level ones Vite's
     // resolve already took in; the plugin list is replaced below.
-    const { plugins: _fresh, ...base } = userResolvedViteConfig;
+    const { plugins: _fresh, ...base } = rc;
     config = mergeConfigLite(base, withoutCliInline(config));
   }
   // Coerce experimental.bundledDev off BEFORE the config/configResolved hooks
@@ -1960,17 +2181,21 @@ async function runConfigHooks() {
   // concatenates arrays) can't accumulate it into duplicates.
   // The natively reimplemented React plugins stay listed (hooks unrun), in
   // enforce order like Vite's resolved plugin array.
-  const configPlugins = withCssPostShim(main.plugins.concat(nativePlugins));
+  const configPlugins = withCssPostShim(list.concat(nativePlugins));
   config.plugins = configPlugins;
-  config = await runConfigHook(config, main.plugins, {
+  let delta = {};
+  config = await runConfigHook(config, list, {
     // What the plugins themselves contributed (Vite merges it into the
     // resolved config); Rust asks for it via getPluginConfig so values oj
     // applies natively (define) reach the compile too.
-    onPartial: (partial) => (pluginConfigDelta = mergeConfigLite(pluginConfigDelta, partial)),
+    onPartial: (partial) => (delta = mergeConfigLite(delta, partial)),
     // Keep the plugin array stable regardless of what a config hook returned.
     keepPlugins: configPlugins,
     // The hooks Vite's resolve already ran on these instances.
     recorded: recordedConfigPartials,
+    replay,
+    rebase,
+    container,
   });
   // Vite runs `configEnvironment(name, options, env)` for every environment after
   // the config hooks and merges what it returns into that environment's options.
@@ -1978,7 +2203,7 @@ async function runConfigHooks() {
   // runConfigEnvironmentHook), the same for every environment.
   const envNames = Object.keys(config.environments ?? {});
   for (const n of ["client", "ssr"]) if (!envNames.includes(n)) envNames.push(n);
-  const configEnvHooks = hooksOf(main.plugins, "configEnvironment");
+  const configEnvHooks = hooksOf(list, "configEnvironment");
   // Plugin by plugin, then environment by environment, as
   // runConfigEnvironmentHook loops.
   if (configEnvHooks.length) {
@@ -1988,13 +2213,25 @@ async function runConfigHooks() {
     const configContext = minimalContext();
     for (const { p, fn } of configEnvHooks) {
       initStage(`configEnvironment:${p.name ?? "?"}`);
+      const seen = environmentPartials(p);
       for (const name of envNames) {
         try {
-          const r = await fn.call(configContext, name, config.environments[name], opts);
-          if (r) config.environments[name] = mergeConfigLite(config.environments[name], r);
+          let record = seen.get(name);
+          const inBase = !!record && !rebase;
+          if (record) {
+            if (rebase) applyEdits(config.environments[name], record.edits);
+            if (record.threw) throw record.threw;
+          } else if (!replay) {
+            const options = config.environments[name];
+            const before = plainCopy(options);
+            const r = await fn.call(configContext, name, options, opts);
+            seen.set(name, (record = hookRecord(before, options, r)));
+          }
+          if (record?.partial && !inBase)
+            config.environments[name] = mergeConfigLite(config.environments[name], plainCopy(record.partial));
         } catch (e) {
           if (!ojStartMode) throw e;
-          main.configHookSkipped = true;
+          container.configHookSkipped = true;
           process.stderr.write(
             `${OJ} plugin host: configEnvironment(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`,
           );
@@ -2006,10 +2243,33 @@ async function runConfigHooks() {
   // so behind a flag); re-coerce so configResolved sees the truth oj serves, or
   // gated plugins run their bundled-dev-only setup.
   coerceBundledDevOff(config);
+  const resolved = withResolvedDefaults(config);
+  resolved.plugins = configPlugins;
+  return { config, resolved, delta };
+}
+async function runConfigHooks() {
+  userResolvedViteConfig = await loadUserResolvedViteConfig();
+  initStage("user-config-resolved");
+  const { config, resolved, delta } = await hostConfig(userResolvedViteConfig, main.plugins);
+  pluginConfigDelta = delta;
   hookedUserConfig = config;
-  main.resolvedConfig = withResolvedDefaults(config);
-  main.resolvedConfig.plugins = configPlugins;
+  main.resolvedConfig = resolved;
+  const before = plainCopy(resolved);
   await runConfigResolved(main.plugins, main.resolvedConfig);
+  configResolvedEdits = editsOf(before, main.resolvedConfig);
+}
+// What the configResolved hooks changed on the resolved config: Vite builds
+// the environments after them, off the object they changed.
+let configResolvedEdits = [];
+// The config a container leaving the reimplemented framework plugins out
+// reads its own values from, made once from the hooks' first answers.
+let leftOutConfig = null;
+function leaveOutConfig() {
+  return (leftOutConfig ??= (async () => {
+    const kept = (p) => !isReimplemented(p && p.name);
+    const rc = await resolveUserViteConfig(allPlugins.filter(kept).map((p) => replayingPlugin(p, true)));
+    return hostConfig(rc, main.topLevelPlugins.filter(kept), { replay: true, container: {} });
+  })());
 }
 // The plugin array a resolved config lists: `list` in enforce order, with the
 // vite:css-post shim when no plugin of that name is there.
@@ -2041,7 +2301,7 @@ async function resolveEnvironment(c, name) {
   environment.config.consumer = own.consumer ?? (name === "client" ? "client" : "server");
   environment.logger = resolvedConfig.logger;
   environment.getTopLevelConfig = () => resolvedConfig;
-  c.plugins = await environmentPlugins(environment, c.topLevelPlugins);
+  c.plugins = await environmentPlugins(environment, c.topLevelPlugins, c);
   environment.plugins = c.plugins;
 }
 
@@ -2049,7 +2309,26 @@ async function resolveEnvironment(c, name) {
 // a falsy result drops the plugin, `true` keeps it, and a plugin or plugin
 // array replaces it with what it returned (perEnvironmentPlugin), whose
 // config-phase hooks are ignored with a warning.
-async function environmentPlugins(environment, candidates) {
+// Vite asks a plugin's applyToEnvironment once per environment (in
+// resolveConfig); every container of that environment, and the real
+// DevEnvironment of a runner-backed one, takes that one answer.
+const appliedToEnvironments = new WeakMap();
+function applyToEnvironmentOnce(p, environment) {
+  let byName = appliedToEnvironments.get(p);
+  if (!byName) appliedToEnvironments.set(p, (byName = new Map()));
+  if (!byName.has(environment.name)) {
+    byName.set(
+      environment.name,
+      (async () => {
+        // A rejection nested in what it returned counts as its own throw.
+        const applied = await p.applyToEnvironment(environment);
+        return applied && applied !== true ? flattenPlugins(applied) : applied;
+      })(),
+    );
+  }
+  return byName.get(environment.name);
+}
+async function environmentPlugins(environment, candidates, c = main) {
   const ignoredEnvironmentPluginHooks = ["config", "configEnvironment", "configureServer", "configResolved"];
   const next = [];
   for (const p of candidates) {
@@ -2060,10 +2339,12 @@ async function environmentPlugins(environment, candidates) {
     let applied;
     initStage(`applyToEnvironment:${p.name ?? "?"}`);
     try {
-      // A rejection nested in what it returned counts as its own throw.
-      applied = await p.applyToEnvironment(environment);
-      if (applied && applied !== true) applied = await flattenPlugins(applied);
+      applied = await applyToEnvironmentOnce(p, environment);
     } catch (e) {
+      // Vite's resolveEnvironmentPlugins lets it reject the resolve, and
+      // with it createServer. Start mode tolerates a framework config's
+      // lifecycle hooks per plugin, keeping the plugin active.
+      if (!ojStartMode) throw decoratePluginError(e, p);
       process.stderr.write(
         `${OJ} plugin host: applyToEnvironment(${p.name ?? "?"}) threw; keeping the plugin active: ${(e && e.message) || e}\n`,
       );
@@ -2075,7 +2356,7 @@ async function environmentPlugins(environment, candidates) {
       next.push(p);
       continue;
     }
-    const returned = applied.filter((ap) => !ojRunsNatively(ap));
+    const returned = applied.filter((ap) => !ojRunsNatively(ap, c));
     for (const ap of returned) {
       const ignored = ignoredEnvironmentPluginHooks.filter((hook) => ap[hook]);
       if (ignored.length > 0) {
@@ -2096,6 +2377,49 @@ function logActivePlugins(list) {
   );
 }
 
+// Another environment on the host's plugin instances, as Vite's createServer
+// gives every environment a container over the one resolved plugin array:
+// the ssr environment's, or a Start bundle's beside the dev server's client.
+// `leaveOut` drops the framework plugins oj reimplements (their state stays
+// shared, their hooks unrun there); `bundle` ends `this.resolve` in the
+// bundle's own resolution. A container of the host's own environment is that
+// environment, not a second one: one environment object, one buildStart.
+// Opened by id, so a revived engine reopens the same containers.
+async function openEnvironmentContainer(spec) {
+  const id = Number(spec.id);
+  if (containers.has(id)) return id;
+  const leaveOut = main.leaveOut || !!spec.leaveOut;
+  const sameEnvironment = spec.name === main.environment.name;
+  const environment = sameEnvironment ? main.environment : { name: spec.name, mode: main.environment.mode };
+  const c = createContainer(id, environment, main.resolvedConfig);
+  c.leaveOut = leaveOut;
+  c.bundle = !!spec.bundle;
+  c.durable = true;
+  c.rawPlugins = main.rawPlugins;
+  c.pluginCss = main.pluginCss;
+  c.topLevelPlugins = leaveOut ? main.topLevelPlugins.filter((p) => !isReimplemented(p.name)) : main.topLevelPlugins;
+  if (leaveOut && !main.leaveOut) {
+    const view = await leaveOutConfig();
+    c.ojConfig = view.resolved;
+    c.configDelta = view.delta;
+    c.hookedConfig = view.config;
+  }
+  if (sameEnvironment) {
+    c.buildStartOwner = main;
+    c.plugins = await environmentPlugins(environment, c.topLevelPlugins, c);
+  } else {
+    environment.transformRequest = transformRequestFor(c);
+    environment.moduleGraph = createModuleGraph(c);
+    environment.hot = serverHotChannel();
+    await resolveEnvironment(c, spec.name);
+    if (command === "serve") c.startAfter = main;
+  }
+  containers.set(id, c);
+  logActivePlugins(c.plugins);
+  return id;
+}
+for (const spec of ojEngineBoot?.containers ?? []) await openEnvironmentContainer(spec);
+
 // Events for the Rust server (not the browser): a plugin invalidating a module
 // through server.moduleGraph, or asking for server.restart().
 function ojServerEvent(action, data) {
@@ -2110,8 +2434,8 @@ function ojServerEvent(action, data) {
 // undefined for anything else (an unknown virtual id) so plugins guarding on it
 // take the same branch as under Vite. `invalidateModule` tells oj to drop the
 // module's compiled output and propagate an update, as Vite's graph does.
-function knownModuleId(id) {
-  if (main.seenIds.has(id)) return true;
+function knownModuleId(id, c = main) {
+  if (c.seenIds.has(id)) return true;
   const file = String(id).split("?", 1)[0];
   if (!file || file.startsWith("\0") || !isAbsolute(file)) return false;
   try {
@@ -2139,7 +2463,9 @@ function applicationModuleUrl(id) {
     ? `/@fs${file.replaceAll("\\", "/")}`
     : `/${rel.replaceAll("\\", "/")}`;
 }
-function createModuleGraph() {
+// One per environment, as each Vite DevEnvironment has its own: `c` is the
+// container whose hooks it knows ids from.
+function createModuleGraph(c = main) {
   const graphNodes = new Map();
   const urlNodes = new Map();
   const fileToModulesMap = new Map();
@@ -2174,16 +2500,16 @@ function createModuleGraph() {
     return n;
   }
   return {
-    getModuleById: (id) => (id == null || !knownModuleId(String(id)) ? undefined : moduleNode(String(id))),
+    getModuleById: (id) => (id == null || !knownModuleId(String(id), c) ? undefined : moduleNode(String(id))),
     // By the served URL first (a node's own `url` round-trips, as in Vite),
     // falling back to the id-shaped lookup plugins used before.
     getModuleByUrl: async (url) =>
       url == null
         ? undefined
-        : (urlNodes.get(String(url)) ?? (knownModuleId(String(url)) ? moduleNode(String(url)) : undefined)),
+        : (urlNodes.get(String(url)) ?? (knownModuleId(String(url), c) ? moduleNode(String(url)) : undefined)),
     getModulesByFile: (file) =>
       fileToModulesMap.get(String(file)) ??
-      (knownModuleId(String(file)) ? new Set([moduleNode(String(file))]) : undefined),
+      (knownModuleId(String(file), c) ? new Set([moduleNode(String(file))]) : undefined),
     // Vite creates the node on demand here (used by plugins that pre-seed urls).
     ensureEntryFromUrl: async (url) => moduleNode(String(url)),
     invalidateModule(mod) {
@@ -2191,14 +2517,14 @@ function createModuleGraph() {
       mod.lastInvalidationTimestamp = Date.now();
       mod.transformResult = null;
       mod.ssrTransformResult = null;
-      ojServerEvent("invalidate", { id: mod.id });
+      ojServerEvent("invalidate", { id: mod.id, environment: c.environment.name });
     },
     invalidateAll() {
       for (const m of graphNodes.values()) m.transformResult = null;
-      ojServerEvent("invalidateAll");
+      ojServerEvent("invalidateAll", { environment: c.environment.name });
     },
     onFileChange(file) {
-      ojServerEvent("invalidate", { id: String(file) });
+      ojServerEvent("invalidate", { id: String(file), environment: c.environment.name });
     },
     urlToModuleMap: urlNodes,
     idToModuleMap: graphNodes,
@@ -2232,6 +2558,25 @@ const wsApi = {
 // MinimalPluginContext); the config/logger were attached once config hooks ran.
 environment.moduleGraph = moduleGraph;
 environment.hot = wsApi;
+// A server environment's hot channel (Vite's createServerHotChannel): its
+// messages are its module runner's, never the browser's, and oj's runners
+// take none, so a send reaches only what listens on the channel itself.
+function serverHotChannel() {
+  const listeners = new Map();
+  return {
+    on(event, cb) {
+      let a = listeners.get(event);
+      if (!a) listeners.set(event, (a = new Set()));
+      a.add(cb);
+    },
+    off(event, cb) {
+      listeners.get(event)?.delete(cb);
+    },
+    send() {},
+    listen() {},
+    close() {},
+  };
+}
 
 // `server.ws.on("connection", cb)` (Vite: the raw ws server's connection event,
 // per client). oj's Rust listener accepts the socket; it tells the host, which
@@ -2410,39 +2755,31 @@ async function buildEnvironments(server) {
   const root =
     (main.resolvedConfig && main.resolvedConfig.root) || (initial.config && initial.config.root) || process.cwd();
   // Real DevEnvironments need a real resolved Vite config (root, cacheDir,
-  // resolve.builtins, per-env dev.createEnvironment factories). Hand-faking it
-  // is endless whack-a-mole, so ask the app's Vite to resolve it once.
+  // resolve.builtins, per-env dev.createEnvironment factories): the app's
+  // Vite resolved it once already, over these very plugin instances, for the
+  // config the host itself runs on. The environments are built from that
+  // resolve, as Vite's createServer builds them from its one resolveConfig:
+  // no second evaluation, no hook run twice on an instance (a second config
+  // hook corrupts stateful plugins, @cloudflare/vite-plugin's
+  // virtual:cloudflare/export-types among them).
   let rc;
   try {
-    // configFile:undefined lets Vite resolve fresh plugin instances. Reusing
-    // oj's instances (configFile:false + plugins) corrupts stateful plugins
-    // (e.g. @cloudflare/vite-plugin's virtual:cloudflare/export-types) when
-    // their config hooks run a second time, so we accept a second resolve. The
-    // environments bind to these fresh instances; oj drives its own instances
-    // in configureServer, and the two agree because both resolve from `root`.
-    hostPhase("cf: resolveConfig begin");
-    initStage("cf:resolveConfig");
-    rc = await asNode(() =>
-      vite.resolveConfig(
-        { root, configFile: undefined, mode: environment.mode },
-        "serve",
-        "development",
-        "development",
-      ),
-    );
-    hostPhase("cf: resolveConfig done");
-    initStage("cf:resolveConfig-done");
-    // The fresh resolve reads the app's vite.config again, so bundledDev is back
-    // on here (and Vite has stamped environments.client.isBundled). Coerce it off
-    // BEFORE the environments are built off `rc`: the DevEnvironment constructor
-    // makes the client env bundled from these fields, and the manifest plugin
-    // bound to these environments reads them at load time.
+    hostPhase("cf: environments config begin");
+    initStage("cf:environments-config");
+    rc = await environmentsConfig();
+    if (!rc) return undefined;
+    hostPhase("cf: environments config done");
+    initStage("cf:environments-config-done");
+    // Coerce bundledDev off BEFORE the environments are built off `rc`: the
+    // DevEnvironment constructor makes the client env bundled from these
+    // fields, and the manifest plugin bound to these environments reads them
+    // at load time.
     coerceBundledDevOff(rc);
     // BEFORE the environments are built: include must be in the config the
     // optimizer hashes, or the preseed child's metadata cannot validate.
     foldIncludeSnapshot(rc, initial.preseedIncludePath);
   } catch (e) {
-    process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed: ${(e && e.message) || e}\n`);
+    process.stderr.write(`${OJ} plugin host: the environments' config failed: ${(e && e.message) || e}\n`);
     return undefined;
   }
   server.config = rc;
@@ -2486,7 +2823,371 @@ async function buildEnvironments(server) {
       }
     }),
   );
+  deferBootRegistrations(environments);
   return environments;
+}
+
+// The deps a server environment's optimizer is handed while the server sets
+// up (a plugin's configureServer registering the polyfills its runtime
+// injects, @cloudflare/vite-plugin's nodejs_compat ones among them) are part
+// of the boot-time pass the deps pre-seed child runs out of process: Vite's
+// optimizer would rerun for them in this process, and rolldown keeps the
+// native memory of every build until the process exits. So until setup ends
+// they are collected, optimized by a one-shot child with the same config and
+// the same registrations, and the environment's optimizer takes the child's
+// committed metadata. A registration after setup is the session discovering
+// a dep, which the optimizer handles here as Vite does.
+let bootRegistrationsOpen = false;
+const bootRegistrationBatches = [];
+function deferBootRegistrations(environments) {
+  if (!ojEnginePost) return;
+  bootRegistrationsOpen = true;
+  let batch = null;
+  for (const [name, environment] of Object.entries(environments)) {
+    const optimizer = environment?.depsOptimizer;
+    if (!optimizer || typeof optimizer.registerMissingImport !== "function") continue;
+    const register = optimizer.registerMissingImport;
+    optimizer.registerMissingImport = (id, resolved) => {
+      const metadata = optimizer.metadata;
+      const known = metadata?.optimized?.[id] ?? metadata?.chunks?.[id] ?? metadata?.discovered?.[id];
+      if (known || !bootRegistrationsOpen) return known ?? register(id, resolved);
+      if (!batch) {
+        batch = { deps: {}, done: null };
+        const current = batch;
+        // One child at a time: each commits over the last one's metadata.
+        const previous = bootRegistrationBatches.at(-1) ?? Promise.resolve();
+        current.done = new Promise((resolve) => setTimeout(resolve, 50))
+          .then(() => {
+            batch = null;
+            return previous;
+          })
+          .then(() => seedBootRegistrations(environments, current.deps))
+          // A failed batch is logged; it never holds the ones after it.
+          .catch((e) => process.stderr.write(`${OJ} plugin host: boot deps batch failed: ${(e && e.message) || e}\n`));
+        bootRegistrationBatches.push(current.done);
+      }
+      const deps = (batch.deps[name] ??= {});
+      if (!deps[id]) {
+        // A discovered dep as Vite's addMissingDep makes it: what an import
+        // of it resolves to meanwhile, its loads waiting out `processing`.
+        const info = {
+          id,
+          file: normalizePath(pathResolve(depsCacheDir(environment), `${flattenDepId(id)}.js`)),
+          src: resolved,
+          browserHash: discoveredBrowserHash(metadata),
+          // What took its place: the child's dep, or this process's
+          // optimizer's. Never itself (a batch that failed left it there).
+          processing: batch.done.then(() => {
+            const now = optimizer.metadata;
+            const next = now.optimized[id] ?? now.discovered[id];
+            return next && next !== info ? next.processing : undefined;
+          }),
+        };
+        metadata.discovered[id] = info;
+        metadata.depInfoList.push(info);
+        deps[id] = info;
+      }
+      return deps[id];
+    };
+    optimizer.registerMissingImport.ojRegister = register;
+  }
+}
+// Vite's getDiscoveredBrowserHash, over this session's start: a new
+// discovery set gets a new hash, so the browser never reuses a stale dep.
+const discoverySession = String(Date.now());
+function discoveredBrowserHash(metadata) {
+  const srcs = (infos) => Object.fromEntries(Object.entries(infos ?? {}).map(([k, v]) => [k, v.src]));
+  return createHash("sha256")
+    .update(
+      metadata.hash +
+        JSON.stringify(srcs(metadata.optimized)) +
+        JSON.stringify(srcs(metadata.discovered)) +
+        discoverySession,
+    )
+    .digest("hex")
+    .substring(0, 8);
+}
+// One batch of setup-time registrations: the child optimizes them, then each
+// optimizer reads the metadata it committed; a failed child leaves them to
+// this process's optimizer, as without the pre-seed.
+async function seedBootRegistrations(environments, deps) {
+  const request = {};
+  for (const [name, byId] of Object.entries(deps)) request[name] = Object.values(byId).map((d) => [d.id, d.src]);
+  // Over the synchronous bridge, polled: the setup may still be running,
+  // waiting on these very deps, before any hook reply could reach the host.
+  let seeded = false;
+  try {
+    const run = bundleRpc("preseedRegistered", [env.mode, JSON.stringify(request)]);
+    while (run != null) {
+      const done = bundleRpc("preseedRegisteredDone", [run]);
+      if (done != null) {
+        seeded = done === true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: boot deps pre-optimization failed: ${(e && e.message) || e}\n`);
+  }
+  for (const [name, byId] of Object.entries(deps)) {
+    const optimizer = environments[name]?.depsOptimizer;
+    if (!optimizer) continue;
+    try {
+      if (seeded && reloadOptimizerMetadata(environments[name], optimizer, Object.keys(byId))) continue;
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: the pre-seeded deps metadata is unreadable: ${(e && e.message) || e}\n`);
+    }
+    // Left to this process's optimizer: the stand-ins make way for its own.
+    const metadata = optimizer.metadata;
+    const standIns = new Set(Object.values(byId));
+    for (const id of Object.keys(byId)) if (standIns.has(metadata.discovered[id])) delete metadata.discovered[id];
+    metadata.depInfoList = metadata.depInfoList.filter((info) => !standIns.has(info));
+    for (const dep of standIns) {
+      try {
+        optimizer.registerMissingImport.ojRegister(dep.id, dep.src);
+      } catch (e) {
+        process.stderr.write(`${OJ} plugin host: optimizing ${dep.id} failed: ${(e && e.message) || e}\n`);
+      }
+    }
+  }
+}
+// The optimizer takes what the child committed as Vite's rerun commits its
+// own result (createDepsOptimizer runOptimizer): unchanged deps keep the
+// browser hash their importers already use, the discovered stand-ins learn
+// their final shape, and a change to a dep already served reloads the
+// environment. In place: the optimizer reads that one metadata object.
+// False when the committed metadata is missing one of `ids`.
+function reloadOptimizerMetadata(environment, optimizer, ids) {
+  const dir = depsCacheDir(environment);
+  let raw;
+  try {
+    raw = readFileSync(join(dir, "_metadata.json"), "utf8");
+  } catch {
+    return false;
+  }
+  // Vite's parseDepsOptimizerMetadata.
+  const parsed = JSON.parse(raw, (key, value) =>
+    key === "file" || key === "src" ? normalizePath(pathResolve(dir, value)) : value,
+  );
+  if (!parsed.chunks || !parsed.optimized || ids.some((id) => !parsed.optimized[id])) return false;
+  const next = { optimized: {}, chunks: {}, discovered: {}, depInfoList: [] };
+  const add = (type, info) => {
+    next[type][info.id] = info;
+    next.depInfoList.push(info);
+  };
+  for (const [id, info] of Object.entries(parsed.optimized))
+    add("optimized", { ...info, id, browserHash: parsed.browserHash });
+  for (const [id, info] of Object.entries(parsed.chunks)) {
+    add("chunks", { ...info, id, browserHash: parsed.browserHash, needsInterop: false });
+  }
+  const metadata = optimizer.metadata;
+  const interopMismatch = Object.entries(metadata.discovered).some(
+    ([id, info]) =>
+      info.needsInterop !== undefined && next.optimized[id] && next.optimized[id].needsInterop !== info.needsInterop,
+  );
+  const needsReload =
+    interopMismatch ||
+    metadata.hash !== parsed.hash ||
+    Object.keys(metadata.optimized).some((id) => metadata.optimized[id].fileHash !== next.optimized[id]?.fileHash);
+  for (const [id, info] of Object.entries(metadata.discovered)) if (!next.optimized[id]) add("discovered", info);
+  let browserHash = parsed.browserHash;
+  if (!needsReload) {
+    browserHash = metadata.browserHash;
+    for (const info of Object.values(next.chunks)) info.browserHash = browserHash;
+    for (const [id, info] of Object.entries(next.optimized)) {
+      info.browserHash = (metadata.optimized[id] || metadata.discovered[id])?.browserHash ?? browserHash;
+    }
+  }
+  for (const [id, optimized] of Object.entries(next.optimized)) {
+    const discovered = metadata.discovered[id];
+    if (!discovered) continue;
+    discovered.browserHash = optimized.browserHash;
+    discovered.fileHash = optimized.fileHash;
+    discovered.needsInterop = optimized.needsInterop;
+    discovered.processing = undefined;
+  }
+  Object.assign(metadata, {
+    hash: parsed.hash,
+    lockfileHash: parsed.lockfileHash,
+    configHash: parsed.configHash,
+    browserHash,
+    ...next,
+  });
+  if (needsReload) {
+    environment.logger?.info?.("optimized dependencies changed. reloading", { timestamp: true });
+    environment.moduleGraph?.invalidateAll?.();
+    environment.hot?.send?.({ type: "full-reload", path: "*" });
+  }
+  return true;
+}
+// Vite's normalizePath, getDepsCacheDir and flattenId.
+function normalizePath(p) {
+  return p.replace(/\\/g, "/");
+}
+function depsCacheDir(environment) {
+  const { cacheDir } = environment.config;
+  return normalizePath(pathResolve(cacheDir, environment.name === "client" ? "deps" : `deps_${environment.name}`));
+}
+function flattenDepId(id) {
+  const flat = id
+    .replaceAll(/_+/g, "$&__")
+    .replaceAll("/", "_")
+    .replaceAll(".", "__")
+    .replace(/\s*>\s*/g, "_n_")
+    .replace(/[\u0000-\u001F"#$%&*+,:;<=>?[\]^`{|}\u007F]/g, (c) => "_0" + c.charCodeAt(0).toString(16) + "_");
+  return flat.length > 170
+    ? `${flat.slice(0, 161)}_${createHash("sha256").update(flat).digest("hex").slice(0, 8)}`
+    : flat;
+}
+
+// The resolve the host's config came from, as Vite's resolveConfig leaves
+// it: its plugin array the host's instances (not the resolve's recording
+// stand-ins), each environment's plugins what applyToEnvironment kept of them.
+async function environmentsConfig() {
+  const base = userResolvedViteConfig ?? (await replayedViteConfig());
+  if (!base) return null;
+  applyEdits(base, configResolvedEdits);
+  configResolvedEdits = [];
+  const plugins = (base.plugins ?? []).map((p) => standInFor.get(p) ?? p);
+  const rc = { ...base, plugins, ...pluginHookUtils(plugins), environments: {} };
+  // The host resolved silently; the environments log as the app's Vite would.
+  const vite = await loadAppVite();
+  if (typeof vite?.createLogger === "function") {
+    rc.logLevel = userViteConfig?.logLevel ?? "info";
+    rc.logger = vite.createLogger(rc.logLevel, {
+      allowClearScreen: false,
+      customLogger: userViteConfig?.customLogger,
+    });
+  }
+  for (const [name, options] of Object.entries(base.environments ?? {})) {
+    rc.environments[name] = { ...options, dev: { ...options?.dev }, optimizeDeps: { ...options?.optimizeDeps } };
+  }
+  for (const name of Object.keys(rc.environments)) {
+    rc.environments[name].plugins = await viteEnvironmentPlugins(name, rc);
+  }
+  return rc;
+}
+// The app's Vite resolving the host's own plugins (an oj plugins file has no
+// vite.config to resolve), each hook answering what it returned in the host.
+async function replayedViteConfig() {
+  const vite = await loadAppVite();
+  if (!vite || typeof vite.resolveConfig !== "function") return null;
+  const root = initial.config?.root ?? process.cwd();
+  try {
+    unsetOjNodeEnvForResolve();
+    return await asNode(() =>
+      vite.resolveConfig(
+        {
+          root,
+          configFile: false,
+          plugins: allPlugins.map((p) => replayingPlugin(p, true)),
+          mode: env.mode,
+          logLevel: "silent",
+        },
+        env.command,
+        env.mode,
+        defaultNodeEnv,
+      ),
+    );
+  } finally {
+    if (!process.env.NODE_ENV) process.env.NODE_ENV = defaultNodeEnv;
+  }
+}
+// Vite's resolveEnvironmentPlugins over a PartialEnvironment of `rc`.
+async function viteEnvironmentPlugins(name, rc) {
+  const options = rc.environments[name];
+  const environment = {
+    name,
+    config: new Proxy(options, { get: (target, key) => (key in target ? target[key] : rc[key]) }),
+    getTopLevelConfig: () => rc,
+    logger: rc.logger,
+  };
+  const out = [];
+  for (const p of rc.plugins) {
+    if (!p) continue;
+    if (typeof p.applyToEnvironment !== "function") {
+      out.push(p);
+      continue;
+    }
+    const applied = await applyToEnvironmentOnce(p, environment);
+    if (!applied) continue;
+    if (applied === true) out.push(p);
+    else out.push(...applied);
+  }
+  return out;
+}
+// Vite's warmupFiles for the runner environments: each environment's own
+// `dev.warmup` (`server.warmup.ssrFiles` for ssr), fire-and-forget as in
+// Vite (transformRequest dedups, warmupRequest swallows outdated-dep and
+// closed-server errors). The reply reports what STARTED. The client
+// environment is never warmed: oj's own pipeline serves the browser, and the
+// in-host client environment's module graph is read by nothing.
+async function warmEnvironments() {
+  const envs = devServer?.environments ?? {};
+  const config = devServer?.config ?? main.resolvedConfig ?? {};
+  const root = config.root ?? initial.config?.root ?? process.cwd();
+  const names = [];
+  let started = 0;
+  for (const [name, environment] of Object.entries(envs)) {
+    if (typeof environment?.warmupRequest !== "function") continue;
+    const options = config.environments?.[name] ?? {};
+    if ((options.consumer ?? (name === "client" ? "client" : "server")) === "client") continue;
+    const patterns = environment.config?.dev?.warmup ?? options.dev?.warmup ?? [];
+    const files = await warmupFiles(Array.isArray(patterns) ? patterns : [], root);
+    if (!files.length) continue;
+    names.push(name);
+    for (const file of files) {
+      started++;
+      const rel = relative(root, file).replace(/\\/g, "/");
+      const url = rel.startsWith("..") || isAbsolute(rel) ? `/@fs/${file.replace(/^\//, "")}` : `/${rel}`;
+      // A custom environment's synchronously throwing warmupRequest must not
+      // escape the dispatch (Vite's own never rejects).
+      void (async () => environment.warmupRequest(url))().catch(() => {});
+    }
+  }
+  return names.length ? JSON.stringify({ environments: names, started }) : null;
+}
+// Vite's mapFiles: plain entries resolved from the root, globs expanded.
+async function warmupFiles(files, root) {
+  const { tinyglobby } = viteGlobs();
+  const out = [];
+  const globs = [];
+  for (const file of files) {
+    if (typeof file !== "string") continue;
+    if (tinyglobby.isDynamicPattern(file)) globs.push(file);
+    else out.push(isAbsolute(file) ? file : pathResolve(root, file));
+  }
+  if (globs.length) {
+    out.push(
+      ...(await tinyglobby.glob(globs, {
+        absolute: true,
+        cwd: root,
+        expandDirectories: false,
+        ignore: ["**/.git/**", "**/node_modules/**"],
+      })),
+    );
+  }
+  return out;
+}
+
+// Vite's createPluginHookUtils: a hook's plugins by its `order`.
+function pluginHookUtils(plugins) {
+  const sorted = new Map();
+  const getSortedPlugins = (hook) => {
+    if (!sorted.has(hook)) {
+      const rank = (p) => hookOrderRank(p[hook]);
+      sorted.set(
+        hook,
+        plugins.filter((p) => p && p[hook]).sort((a, b) => rank(a) - rank(b)),
+      );
+    }
+    return sorted.get(hook);
+  };
+  const getSortedPluginHooks = (hook) =>
+    getSortedPlugins(hook)
+      .map((p) => hookHandler(p[hook]))
+      .filter(Boolean);
+  return { getSortedPlugins, getSortedPluginHooks };
 }
 
 function hostPhase(label) {
@@ -2658,7 +3359,9 @@ async function invalidateChange(environments, watcher, file, type) {
   for (const env of Object.values(environments)) {
     // oj's own HMR already covers the stub environments; only runner-backed
     // (real Vite) environments need their graph invalidated and updates sent.
-    if (!env || env.__ojStub) continue;
+    // The client environment is oj's own: the dev server's pass runs its
+    // hooks once (Vite's single pass per environment).
+    if (!env || env.__ojStub || env.name === "client") continue;
     try {
       let hit = await hotUpdateEnvironment(env, file, timestamp, type);
       if (!hit && real) hit = await hotUpdateEnvironment(env, real, timestamp, type);
@@ -3000,6 +3703,30 @@ function stubHttpServer() {
 // moduleGraph, hot, plugins, pluginContainer over the host's chains). The client
 // stub shares server.moduleGraph; others get their own graph. Marked so oj's
 // invalidation of runner-backed environments skips it.
+// Vite's `server.environments.<name>` is the very environment the hooks see
+// as `this.environment` (createServer inits them before configureServer): a
+// container of that environment's, filled out to the DevEnvironment surface
+// the stand-in below offers, its own graph, channel and plugins kept. Like
+// the stand-in it is oj's (`__ojStub`), never a runner-backed Vite one.
+function containerEnvironment(name, server) {
+  const c =
+    main.environment.name === name
+      ? main
+      : [...containers.values()].find((x) => x.durable && !x.buildStartOwner && x.environment.name === name);
+  if (!c) return null;
+  const environment = c.environment;
+  const stub = stubEnvironment(name, server);
+  for (const [key, value] of Object.entries(stub)) {
+    if (environment[key] === undefined) environment[key] = value;
+  }
+  environment.pluginContainer = {
+    ...stub.pluginContainer,
+    resolveId: async (source, importer, options) => resolveIdFull(c, source, importer, options),
+    load: async (id) => loadFull(c, id),
+    transform: async (code, id) => ({ code: JSON.parse(await transform(c, code, id, null)).code }),
+  };
+  return environment;
+}
 function stubEnvironment(name, server) {
   const isClient = name === "client";
   const base = main.resolvedConfig ?? {};
@@ -3008,7 +3735,7 @@ function stubEnvironment(name, server) {
   // inherits the host environment's tag, so set it per environment.
   if (isClient) config.consumer = config.consumer ?? "client";
   else config.consumer = (base.environments ?? {})[name]?.consumer ?? "server";
-  const mg = isClient ? moduleGraph : createModuleGraph();
+  const mg = isClient ? moduleGraph : createModuleGraph({ seenIds: main.seenIds, environment: { name } });
   return {
     __ojStub: true,
     name,
@@ -3498,10 +4225,9 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
 // Vite runs the server-level setup once per dev server (server/index.ts:
 // configureServer hooks, the proxy, the environments), on plugin instances
 // every environment shares; a per-environment plugin's configureServer is
-// ignored (plugin.ts resolveEnvironmentPlugins). oj's ssr host holds its own
-// instances of the same plugins, and the client host is the server oj routes
-// to, so only the client host does that setup. Running it in both started
-// every plugin's side effects twice (e.g. a second devtools event bus).
+// ignored (plugin.ts resolveEnvironmentPlugins). The dev server's host is
+// the client's, and its other environments are containers on it, so the
+// setup runs once, there; a host of the ssr environment (a build's) runs none.
 const ownsServer = hostEnvName === "client";
 
 async function setupConfigureServer() {
@@ -3634,7 +4360,7 @@ async function setupConfigureServer() {
   // `initial.runnerBacked`. Extraction TRUE is authoritative and sufficient —
   // a declaring plugin whose config hook failed IN THIS HOST keeps the path:
   // the extractor's independent run already decided, and buildEnvironments
-  // re-resolves on fresh instances where the hook may well succeed. Extraction
+  // builds from what the app's Vite resolved. Extraction
   // FALSE or ABSENT is NOT final: it falls through to the host's own
   // declaration check (the raw user config, oj's initial config, and
   // pluginConfigDelta — never the Vite-RESOLVED config, whose every
@@ -3692,7 +4418,8 @@ async function setupConfigureServer() {
   if (!server.environments) {
     server.environments = {};
     const envNames = new Set(["client", "ssr", ...Object.keys(main.resolvedConfig?.environments ?? {})]);
-    for (const name of envNames) server.environments[name] = stubEnvironment(name, server);
+    for (const name of envNames)
+      server.environments[name] = containerEnvironment(name, server) ?? stubEnvironment(name, server);
   }
   devServer = server;
   const post = [];
@@ -3748,6 +4475,8 @@ async function setupConfigureServer() {
       process.stderr.write(`${OJ} plugin host: post configureServer skipped: ${(e && e.message) || e}\n`);
     }
   }
+  // Setup is over: later registrations are the session's own discoveries.
+  bootRegistrationsOpen = false;
   ojConfigureServerDone = true;
   // The middleware server exists as soon as configureServer registered
   // anything, like Vite's connect stack exists at createServer — never
@@ -4083,7 +4812,8 @@ async function transform(c, code, id, resolvedJson, phase) {
     c.moduleInfoCache.set(id, info);
     c.seenIds.add(id);
     // A Start build's bundler reports every parsed module itself (bundleModuleParsed).
-    if (!bundleBuild) for (const { p, fn } of pluginsWithHook(c, "moduleParsed")) await fn.call(ctxFor(c, p), info);
+    if (!bundleBuildOf(c))
+      for (const { p, fn } of pluginsWithHook(c, "moduleParsed")) await fn.call(ctxFor(c, p), info);
     return result();
   };
   return transformWatchStore.run(bucket, () =>
@@ -4104,7 +4834,7 @@ const anyModuleParsed = (c) => pluginsWithHook(c, "moduleParsed").length > 0;
 // every module it parses (node_modules included) with the resolved imports,
 // Rollup's ModuleInfo, and the code as JS (Vite's vite:oxc lowers TS and JSX
 // in a transform, so plugins never read either).
-const bundleBuild = ojBundleHost && command === "build";
+const bundleBuildOf = (c) => c.bundle && command === "build";
 async function bundleModuleParsed(c, infoJson) {
   const reported = JSON.parse(infoJson);
   const prior = c.moduleInfoCache.get(reported.id);
@@ -4151,11 +4881,11 @@ async function switchEnvironment(c, name) {
 // marked `isWorker` with the bundle chain, then applyToEnvironment over a
 // `client` environment of that config. The reply is the container's id.
 let workerPluginsArrayWarned = false;
-async function openWorkerContainer(bundleChain) {
+async function openWorkerContainer(parent, bundleChain) {
   // Vite reads `worker.plugins` off the config its config hooks returned: a
   // plugin's own value, else the user's. Not hookedUserConfig's, which sits on
   // Vite's resolved config, whose `worker.plugins` is Vite's own resolver.
-  let create = pluginConfigDelta.worker?.plugins ?? userViteConfig?.worker?.plugins;
+  let create = (parent.configDelta ?? pluginConfigDelta).worker?.plugins ?? userViteConfig?.worker?.plugins;
   if (Array.isArray(create)) {
     const list = create;
     create = () => list;
@@ -4167,16 +4897,24 @@ async function openWorkerContainer(bundleChain) {
     }
   }
   const raw = await flattenPlugins(typeof create === "function" ? create() : []);
-  const workerPlugins = hostedPlugins(raw, userViteConfig);
+  const workerPlugins = hostedPlugins(raw, userViteConfig, parent);
   const c = createContainer(nextContainerId++, { name: "client", mode: environment.mode }, null);
+  c.leaveOut = parent.leaveOut;
+  c.bundle = parent.bundle;
   c.topLevelPlugins = workerPlugins;
   c.rawPlugins = raw;
-  const workerConfig = await runConfigHook(mergeConfigLite({}, hookedUserConfig), workerPlugins, { container: c });
+  const workerConfig = await runConfigHook(
+    mergeConfigLite({}, parent.hookedConfig ?? hookedUserConfig),
+    workerPlugins,
+    {
+      container: c,
+    },
+  );
   const resolved = {
     ...workerConfig,
-    ...main.resolvedConfig,
+    ...parent.resolvedConfig,
     isWorker: true,
-    mainConfig: main.resolvedConfig,
+    mainConfig: parent.resolvedConfig,
     bundleChain,
   };
   // As the app's: the natively run plugins stay listed (hooks unrun).
@@ -4184,6 +4922,7 @@ async function openWorkerContainer(bundleChain) {
   resolved.plugins = withCssPostShim(workerPlugins.concat(native), cssPostShimInto(c.pluginCss));
   await runConfigResolved(workerPlugins, resolved, c);
   c.resolvedConfig = resolved;
+  if (parent.ojConfig) c.ojConfig = { ...workerConfig, ...parent.ojConfig, isWorker: true, bundleChain };
   await resolveEnvironment(c, "client");
   containers.set(c.id, c);
   logActivePlugins(c.plugins);
@@ -4280,9 +5019,27 @@ function htmlHookFn(p) {
   return typeof fn === "function" ? fn : null;
 }
 
-async function watchChange(id, event) {
-  for (const { fn } of pluginsWithHook(main, "watchChange")) await fn.call(contextOf(main), id, { event });
+// A container of an environment the app's Vite runs for real (a plugin's
+// dev.createEnvironment, the Cloudflare shape) is not a second one: that
+// environment's own container runs its hooks, as in Vite's single pass.
+function runnerOwns(c) {
+  if (!c.startAfter || !runnerEnvironmentsBuilt) return false;
+  const real = devServer?.environments?.[c.environment.name];
+  return !!real && !real.__ojStub && real !== c.environment;
+}
+async function watchChange(c, id, event) {
+  if (runnerOwns(c)) return null;
+  for (const { p, fn } of pluginsWithHook(c, "watchChange")) {
+    if (!runsInDevEnvironment(c, p, "perEnvironmentWatchChangeDuringDev")) continue;
+    await fn.call(ctxFor(c, p), id, { event });
+  }
   return null;
+}
+// Vite's dev rule for buildStart, buildEnd and watchChange: every plugin runs
+// them on the client environment, another environment's container only the
+// plugins that ask for it per environment (`flag`, or the server option).
+function runsInDevEnvironment(c, p, flag) {
+  return !c.startAfter || !!c.resolvedConfig?.server?.[flag] || !!p[flag];
 }
 
 // Any hook can be a bare function or Vite's object form { order, filter, handler }
@@ -4501,7 +5258,7 @@ function factValue(v, fns, seen = new Set()) {
 }
 async function startFacts(c) {
   const fns = (c.startFns = []);
-  const cfg = c.resolvedConfig ?? {};
+  const cfg = c.ojConfig ?? c.resolvedConfig ?? {};
   const envOf = (name) => cfg.environments?.[name] ?? {};
   const self = envOf(c.environment.name);
   const top = cfg.build?.rolldownOptions ?? cfg.build?.rollupOptions ?? {};
@@ -4740,7 +5497,8 @@ async function readModifiedFile(file) {
   return readFile(file, "utf8");
 }
 
-async function handleHotUpdate(file, timestamp, type, modulesJson) {
+async function handleHotUpdate(c, file, timestamp, type, modulesJson) {
+  if (runnerOwns(c)) return null;
   let modules;
   try {
     modules = modulesJson ? JSON.parse(modulesJson) : [];
@@ -4758,10 +5516,10 @@ async function handleHotUpdate(file, timestamp, type, modulesJson) {
     server: devServer,
   };
   let filtered = null;
-  for (const { p, fn } of hotUpdatePlugins()) {
+  for (const { p, fn } of hotUpdatePlugins(c, hmrContext.type)) {
     let r;
     try {
-      r = await fn.call(ctxFor(main, p), hmrContext);
+      r = await fn.call(ctxFor(c, p), hmrContext);
     } catch (e) {
       // Vite records the failing hook's error and sends it to the client
       // (hmr.ts); name the plugin so the overlay says who threw.
@@ -4780,12 +5538,14 @@ async function handleHotUpdate(file, timestamp, type, modulesJson) {
   return JSON.stringify({ action: "filter", modules: filtered });
 }
 
-// Vite 6+: `plugin.hotUpdate ?? plugin.handleHotUpdate` (the Environment API hook
-// takes precedence, with the same context shape plus this.environment).
-function hotUpdatePlugins() {
+// Vite 6+ (handleHMRUpdate): a plugin's `hotUpdate`, with this.environment,
+// in every environment; the legacy `handleHotUpdate` in its stead runs once,
+// in the client environment's pass, and only for an `update`.
+function hotUpdatePlugins(c, type) {
   const out = [];
-  for (const p of main.plugins) {
-    const hook = p.hotUpdate != null ? p.hotUpdate : p.handleHotUpdate;
+  for (const p of c.plugins) {
+    const legacy = p.hotUpdate == null && !c.startAfter && (type === undefined || type === "update");
+    const hook = p.hotUpdate != null ? p.hotUpdate : legacy ? p.handleHotUpdate : null;
     const fn = hookHandler(hook);
     if (fn) out.push({ p, fn, rank: hookOrderRank(hook) });
   }
@@ -4927,7 +5687,21 @@ async function runHookOrThrow(c, p, fn, args) {
 // `buildEnd(error?)`: Rollup hands the hook the error that failed the build
 // (Vite's pluginContainer.close and rolldown both do), so a failed build still
 // reaches every plugin's cleanup with the cause.
-async function runLifecycle(c, hook, args) {
+// Vite's EnvironmentPluginContainer.close: buildEnd, then closeBundle with
+// what buildEnd threw, which the close then rejects with.
+async function closeEnvironment(c) {
+  if (runnerOwns(c)) return null;
+  let buildEndError;
+  try {
+    await runLifecycle(c, "buildEnd", []);
+  } catch (e) {
+    buildEndError = e;
+  }
+  await runLifecycle(c, "closeBundle", [], buildEndError);
+  if (buildEndError) throw buildEndError;
+  return null;
+}
+async function runLifecycle(c, hook, args, closeError) {
   // Rollup runs closeBundle once per build; oj reaches it from rolldown's own
   // failure path and from its explicit call, so the second is a no-op.
   if (hook === "closeBundle") {
@@ -4940,7 +5714,12 @@ async function runLifecycle(c, hook, args) {
     err.code = "BUILD_FAILED";
     hookArgs = [err];
   }
-  for (const { p, fn } of pluginsWithHook(c, hook)) await runHookOrThrow(c, p, fn, hookArgs);
+  if (hook === "closeBundle" && closeError) hookArgs = [closeError];
+  for (const { p, fn } of pluginsWithHook(c, hook)) {
+    // Vite's EnvironmentPluginContainer.close: buildEnd by buildStart's rule.
+    if (hook === "buildEnd" && !runsInDevEnvironment(c, p, "perEnvironmentStartEndDuringDev")) continue;
+    await runHookOrThrow(c, p, fn, hookArgs);
+  }
   return null;
 }
 
@@ -4952,8 +5731,13 @@ async function runBuildStart(c) {
   const options = {
     input: c.resolvedConfig?.build?.rollupOptions?.input ?? "index.html",
   };
+  // Vite's dev server starts every plugin on the client environment; another
+  // environment's buildStart runs only the plugins that ask for it.
   await transformEmitStore.run(chunkBucket, async () => {
-    for (const { p, fn } of pluginsWithHook(c, "buildStart")) await runHookOrThrow(c, p, fn, [options]);
+    for (const { p, fn } of pluginsWithHook(c, "buildStart")) {
+      if (!runsInDevEnvironment(c, p, "perEnvironmentStartEndDuringDev")) continue;
+      await runHookOrThrow(c, p, fn, [options]);
+    }
   });
   return JSON.stringify({ emittedChunks: chunkBucket });
 }
@@ -4972,8 +5756,14 @@ async function runBuildStart(c) {
 // homes — an explicit buildStart caller gets the rejection (Rust fails the
 // boot, or logs-and-skips on the Start path) while a gated hook proceeds past
 // a failed buildStart and serves on, as the old world did after logging.
+// Vite awaits the client's buildStart before the server listens; another
+// environment's container starts on its own first use, whatever the client's
+// start came to.
 function ensureBuildStart(c) {
-  return (c.buildStartRun ??= runBuildStart(c));
+  if (c.buildStartOwner) return ensureBuildStart(c.buildStartOwner);
+  if (runnerOwns(c)) return Promise.resolve();
+  const run = () => runBuildStart(c);
+  return (c.buildStartRun ??= c.startAfter ? ensureBuildStart(c.startAfter).then(run, run) : run());
 }
 async function gateOnBuildStart(c) {
   try {
@@ -5070,9 +5860,10 @@ async function run(hook, args, c) {
     } catch {}
     return null;
   }
-  if (hook === "openWorkerContainer") return String(await openWorkerContainer(JSON.parse(args[0] ?? "[]")));
+  if (hook === "openWorkerContainer") return String(await openWorkerContainer(c, JSON.parse(args[0] ?? "[]")));
+  if (hook === "openEnvironmentContainer") return String(await openEnvironmentContainer(JSON.parse(args[0] ?? "{}")));
   if (hook === "closeContainer") {
-    if (c !== main) containers.delete(c.id);
+    if (c !== main && (!c.durable || args[0] === "environment")) containers.delete(c.id);
     return null;
   }
   if (hook === "transform") return gateOnBuildStart(c).then(() => transform(c, args[0], args[1], args[2]));
@@ -5089,15 +5880,16 @@ async function run(hook, args, c) {
   if (hook === "scanPluginHook") return gateOnBuildStart(main).then(() => scanPluginHook(args[0], args[1]));
   if (hook === "load") return gateOnBuildStart(c).then(() => load(c, args[0]));
   if (hook === "loadPhase") return gateOnBuildStart(c).then(() => load(c, args[0], args[1]));
-  if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1], args[2], args[3]);
+  if (hook === "handleHotUpdate") return handleHotUpdate(c, args[0], args[1], args[2], args[3]);
   if (hook === "transformIndexHtml") return gateOnBuildStart(main).then(() => transformIndexHtml(args[0], args[1]));
   if (hook === "transformIndexHtmlPhase") return transformIndexHtml(args[0], args[1], args[2]);
   if (hook === "buildStart") return ensureBuildStart(c);
+  if (hook === "closeEnvironment") return closeEnvironment(c);
   if (hook === "buildEnd" || hook === "renderStart" || hook === "closeBundle") {
     return runLifecycle(c, hook, args);
   }
   if (hook === "wsConnection") return wsConnection();
-  if (hook === "watchChange") return watchChange(args[0], args[1]);
+  if (hook === "watchChange") return watchChange(c, args[0], args[1]);
   if (hook === "getEmittedFiles") {
     return JSON.stringify(c.emitted.map(({ fileName, source }) => ({ fileName, source })));
   }
@@ -5107,39 +5899,7 @@ async function run(hook, args, c) {
     await devServer?.close?.();
     return null;
   }
-  if (hook === "warmEnvironments") {
-    // Vite's warmup shape (server/warmup.ts): fire-and-forget. Nobody awaits
-    // warmupFiles' promises there; transformRequest dedups concurrent
-    // requests and warmupRequest swallows outdated-dep/closed-server errors.
-    // The reply reports what STARTED: awaiting completion here would park a
-    // whole cold-graph warm behind one RPC window and time out on exactly the
-    // boots the warm exists for. Every environment with a real warmupRequest
-    // is warmed, INCLUDING client (Vite's clientFiles warm exactly it, and
-    // Start route modules execute on both sides); an auxiliary worker
-    // environment that never imports the routes pays a bounded extra
-    // transform per url, the price of not guessing which environments render.
-    // A host without a dev server, or an empty url list, replies null; the
-    // caller reads that as nothing-warmable. (This hook is only ever invoked
-    // for the runner-environment shape, so warming the host's default
-    // environments is never a stray non-runner cost.)
-    let urls = [];
-    try {
-      const parsed = JSON.parse(args[0] ?? "[]");
-      if (Array.isArray(parsed)) urls = parsed.filter((u) => typeof u === "string");
-    } catch {}
-    const envs = devServer?.environments ?? {};
-    const names = Object.keys(envs).filter((n) => typeof envs[n]?.warmupRequest === "function");
-    if (!names.length || !urls.length) return null;
-    for (const n of names) {
-      for (const u of urls) {
-        // The async wrapper contains a CUSTOM environment's synchronously
-        // throwing warmupRequest (Vite's own never rejects), which would
-        // otherwise escape and fail the whole call.
-        void (async () => envs[n].warmupRequest(u))().catch(() => {});
-      }
-    }
-    return JSON.stringify({ environments: names, started: names.length * urls.length });
-  }
+  if (hook === "warmEnvironments") return warmEnvironments();
   if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
   if (hook === "hasModuleParsed") return String(anyModuleParsed(c));
   if (hook === "bundleModuleParsed") return bundleModuleParsed(c, args[0]);
@@ -5166,11 +5926,11 @@ async function run(hook, args, c) {
       // module-info map this.getModuleInfo()/getModuleIds() read, so a hook
       // that may call them later (the manifest-plugin shape) pins it too. A
       // bundle's getters read the bundle's own graph (bundleModuleInfo).
-      const inBundle = command === "build" || ojBundleHost;
+      const inBundle = command === "build" || c.bundle;
       if (
         name === "transform" &&
         withCode &&
-        ((!bundleBuild && anyModuleParsed(c)) ||
+        ((!bundleBuildOf(c) && anyModuleParsed(c)) ||
           (!inBundle &&
             (pluginsWithHook(c, "generateBundle").length > 0 ||
               pluginsWithHook(c, "renderChunk").length > 0 ||
@@ -5213,11 +5973,17 @@ async function run(hook, args, c) {
       transform: planFor("transform", true),
       load: planFor("load", false),
       resolveId: planFor("resolveId", false),
+      watchChange:
+        !runnerOwns(c) &&
+        pluginsWithHook(c, "watchChange").some(({ p }) =>
+          runsInDevEnvironment(c, p, "perEnvironmentWatchChangeDuringDev"),
+        ),
+      hotUpdate: !runnerOwns(c) && hotUpdatePlugins(c).length > 0,
     });
   }
   if (hook === "hasGenerateBundle") {
     // Without emitAssets vite:asset's own generateBundle runs.
-    return String(pluginsWithHook(c, "generateBundle").length > 0 || (bundleBuild && !environmentEmitAssets(c)));
+    return String(pluginsWithHook(c, "generateBundle").length > 0 || (bundleBuildOf(c) && !environmentEmitAssets(c)));
   }
   if (hook === "generateBundle") return generateBundle(c, args[0], args[1] === "true");
   if (hook === "hasRenderChunk") {
@@ -5229,6 +5995,7 @@ async function run(hook, args, c) {
   }
   if (hook === "writeBundle") return writeBundle(c, args[0], args[1] === "true");
   if (hook === "getPluginCount") return String(c.plugins.length);
+  if (hook === "getTopLevelPluginCount") return String(c.topLevelPlugins.length);
   if (hook === "getPluginNames") return JSON.stringify(c.plugins.map((p) => p.name ?? ""));
   if (hook === "getPluginConfig") {
     // JSON-safe subset of what config() hooks returned (functions/RegExps
@@ -5239,8 +6006,8 @@ async function run(hook, args, c) {
     let define = null;
     try {
       const merged = {
-        ...(pluginConfigDelta.define ?? {}),
-        ...(c.resolvedConfig?.environments?.[c.environment.name]?.define ?? {}),
+        ...((c.configDelta ?? pluginConfigDelta).define ?? {}),
+        ...((c.ojConfig ?? c.resolvedConfig)?.environments?.[c.environment.name]?.define ?? {}),
       };
       define = Object.keys(merged).length ? JSON.parse(JSON.stringify(merged)) : null;
     } catch {}
@@ -5306,11 +6073,6 @@ async function run(hook, args, c) {
   if (hook === "getHasLoad") {
     const has = c.plugins.some((p) => typeof hookHandler(p.load) === "function");
     return String(has);
-  }
-  if (hook === "getHmrHooks") {
-    const watchChangeHook = pluginsWithHook(main, "watchChange").length > 0;
-    const hotUpdateHook = hotUpdatePlugins().length > 0;
-    return JSON.stringify({ watchChange: watchChangeHook, handleHotUpdate: hotUpdateHook });
   }
   if (hook === "getServeInfo") {
     return JSON.stringify({ middlewarePort, runnerEnvironments: runnerEnvironmentsBuilt });

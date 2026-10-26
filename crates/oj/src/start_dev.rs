@@ -21,6 +21,8 @@ use crate::start_chunks::{respond, Chunk};
 use crate::start_host::{StartEngine, StartRequest, StartResponse};
 
 struct StartState {
+    /// The dev server's restarts, checked before they replace it.
+    restarter: Arc<oj_server::Restarter>,
     /// The scripts' env (see `script_env`), resolved once at boot for the
     /// watch-reload codegen and rebundles.
     script_env: Arc<[(String, String)]>,
@@ -278,6 +280,8 @@ pub async fn start_dev(
     // plugin children (workerd) spawn well before the server listens.
     let host_slot = std::sync::Arc::new(std::sync::OnceLock::new());
     tokio::spawn(oj_server::close_plugins_on_shutdown(host_slot.clone()));
+    // The client bundle's plugins run on the dev server's host, as soon as it is up.
+    let (dev_host_tx, dev_host_rx) = tokio::sync::watch::channel(None);
     let built_task = tokio::spawn({
         let dev_server = oj_server::DevServer {
             root: root.clone(),
@@ -290,7 +294,11 @@ pub async fn start_dev(
             mode: Some(mode.clone()),
         };
         async move {
-            let built = dev_server.build_app().await?;
+            let built = dev_server
+                .build_app_with(move |host| {
+                    let _ = dev_host_tx.send(Some(host));
+                })
+                .await?;
             // Subscribed the moment the server (and its watcher) exists, not
             // after the client bundle joins: an edit landing during the rest
             // of boot queues for the Start watcher instead of being lost.
@@ -335,7 +343,7 @@ pub async fn start_dev(
             config: inputs.config,
             app_env: inputs.app_env,
         };
-        Arc::new(ClientBundler::new(start, config_file.clone()))
+        Arc::new(ClientBundler::new(start, config_file.clone()).on_dev_host(dev_host_rx))
     };
     // A Cloudflare app's documents come from the worker environments, which
     // render them from TanStack's own manifest: their pages load the dev
@@ -378,10 +386,6 @@ pub async fn start_dev(
     // The in-process Start runner: an embedded engine whose module host runs
     // the dev server's SSR pipeline (StartHost); it needs the built app's
     // SsrBridge, so it comes up once the server build joins.
-    // The app's own server.warmup lists (Vite semantics, globs included), from
-    // the adopted config; they join the route tree in the runner transform
-    // warm below.
-    let warm_patterns;
     let hmr_overlay;
     let engine = {
         let mut config = oj_config::load(&root).unwrap_or_default();
@@ -393,10 +397,6 @@ pub async fn start_dev(
             &mode,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
-        warm_patterns = {
-            let (client, ssr) = oj_config::server_warmup_files(&config);
-            [client, ssr].concat()
-        };
         hmr_overlay = match config.server.as_ref().and_then(|s| s.hmr.as_ref()) {
             Some(oj_config::HmrConfig::Options(o)) => o.overlay.unwrap_or(true),
             _ => true,
@@ -446,7 +446,6 @@ pub async fn start_dev(
         let engine = Arc::clone(&engine);
         let reload_tx = reload_tx.clone();
         let warm_host = built.plugin_host.clone();
-        let warm_root = root.clone();
         tokio::spawn(async move {
             if cf_hint {
                 if let Some(mut hold) = prewarm_hold {
@@ -458,26 +457,18 @@ pub async fn start_dev(
                             // Warming oj's OWN engine is wasted here (the
                             // worker environments render the documents), but
                             // skipping entirely left the first request to pay
-                            // the whole cold graph. Two warms instead, like
-                            // Vite's warmup but fed from the route tree:
-                            // every route module's transform fires at once in
-                            // the host (parallel across cores), while one
-                            // real render through the serving path chases the
-                            // warm transforms and fills the runner's module
-                            // cache. transformRequest dedups the overlap.
+                            // the whole cold graph. One real render through
+                            // the serving path fills the runner's module
+                            // cache instead, beside the app's own
+                            // `server.warmup` files, which the host warms in
+                            // their environments as Vite's warmup does.
                             oj_server::boot_phase("prewarm: engine skipped (worker environments)");
                             let transforms = async {
-                                let urls = runner_warm_urls(&warm_root, &warm_patterns);
-                                if urls.is_empty() {
-                                    return;
-                                }
                                 if let Some(host) = warm_host.as_deref() {
                                     // The host DISPATCHES the warms and replies
                                     // immediately (Vite's warmup is equally
-                                    // fire-and-forget); awaiting completion
-                                    // would park a cold-graph warm behind one
-                                    // RPC window.
-                                    match host.warm_environments(&urls).await {
+                                    // fire-and-forget).
+                                    match host.warm_environments().await {
                                         Ok(Some(summary)) => oj_server::boot_phase(&format!(
                                             "runner transform warm dispatched ({summary})"
                                         )),
@@ -537,6 +528,7 @@ pub async fn start_dev(
     // The dev urls' prefix under `base` (see oj_server::start_dev_url_base).
     let base = oj_server::start_dev_url_base(bundler.base());
     let state = Arc::new(StartState {
+        restarter: Arc::clone(&built.restarter),
         script_env: Arc::clone(&script_vars),
         bundler,
         proxy_prefixes: built.proxy_prefixes.clone(),
@@ -739,28 +731,6 @@ async fn ensure_runner_fresh(state: &StartState) {
     {
         state.engine.reload().await;
     }
-}
-
-/// The urls the runner-environment transform warm fires: every route module
-/// plus the router entry, as root-relative urls (Vite's warmup.ts fileToUrl
-/// shape), joined by the app's own `server.warmup` lists expanded with Vite's
-/// glob semantics. The route tree is what the first render will walk, so
-/// warming it is the whole graph minus dependencies the optimizer already
-/// bundled.
-fn runner_warm_urls(root: &Path, warmup_patterns: &[String]) -> Vec<String> {
-    let mut files: std::collections::BTreeSet<PathBuf> = list_route_files(root);
-    for entry in ["src/router.tsx", "src/router.ts"] {
-        let p = root.join(entry);
-        if p.is_file() {
-            files.insert(p);
-        }
-    }
-    files.extend(oj_server::warmup_paths(root, warmup_patterns));
-    files
-        .iter()
-        .filter_map(|f| f.strip_prefix(root).ok())
-        .map(|rel| format!("/{}", rel.to_string_lossy().replace('\\', "/")))
-        .collect()
 }
 
 /// One real GET / through oj's own router service — the serving path a user
@@ -1279,7 +1249,7 @@ fn spawn_start_watcher(
             if paths.iter().any(|p| start_entry_candidate(p))
                 && crate::start_host::app_start_entry(&watch_root) != boot_entry
             {
-                oj_server::restart_process("the start entry changed");
+                state.restarter.request("the start entry changed");
             }
             // Rebuild only on a real source-file change. Ignore the generated
             // route tree and its atomic-write temp siblings, plus bare directory

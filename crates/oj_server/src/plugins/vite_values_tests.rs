@@ -178,7 +178,7 @@ async fn spawn_live_host(tag: &str) -> (PathBuf, std::sync::Arc<PluginHost>) {
         "env": { "command": "serve", "mode": "development" },
     })
     .to_string();
-    let host = PluginHost::spawn_lazy(&root, &plugins, &config, None)
+    let host = PluginHost::spawn(&root, &plugins, &config, None)
         .await
         .expect("the embedded engine spawns");
     host.resolve_id("x", "").await.expect("a live host serves");
@@ -252,6 +252,274 @@ async fn a_worker_container_handle_dies_with_its_engine() {
     new.close_container().await.expect("closed");
 }
 
+// An environment container is part of the host: a revived engine reopens it
+// under the same id, on its plugins, and its gates refetch their filters.
+#[tokio::test]
+async fn a_revived_host_reopens_its_environment_containers() {
+    let root = std::env::temp_dir().join(format!("oj-revive-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let plugins = root.join("oj.plugins.mjs");
+    std::fs::write(
+        &plugins,
+        r#"export default [{
+  name: "ssr-md",
+  applyToEnvironment: (environment) => environment.name === "ssr",
+  transform: { filter: { id: /\.md$/ }, handler(code) { return code + " in " + this.environment.name; } },
+}];
+"#,
+    )
+    .unwrap();
+    let config = serde_json::json!({
+        "config": { "root": root.display().to_string() },
+        "env": { "command": "serve", "mode": "development" },
+    })
+    .to_string();
+    let host = PluginHost::spawn(&root, &plugins, &config, None)
+        .await
+        .expect("the embedded engine spawns");
+    let ssr = host
+        .open_environment_container("ssr", false, false)
+        .await
+        .expect("an ssr container");
+    let md = root.join("a.md").display().to_string();
+    let tsx = root.join("a.tsx").display().to_string();
+    let served = |t: HostTransform| t.code;
+    assert_eq!(
+        served(ssr.transform("# a", &md, "").await.unwrap()),
+        "# a in ssr"
+    );
+    assert_eq!(
+        served(host.transform("# a", &md, "").await.unwrap()),
+        "# a",
+        "the client runs no ssr-only plugin"
+    );
+
+    let generation = host.core.revive.lock().unwrap().generation;
+    host.core.declare_gone("test wedge", generation);
+    clear_respawn_spacing(&host);
+    assert_eq!(
+        served(ssr.transform("# b", &md, "").await.expect("revived")),
+        "# b in ssr",
+        "the revived engine reopened the container"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ssr.hook_wants_transform(&tsx, "export default 1") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reopened container never fetched its plan again"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+// An engine that wedges while an environment container opens is declared
+// gone and comes back with it: the revived engine opens it from its seed,
+// and the open adopts that container rather than failing (and leaving it
+// orphaned there).
+#[tokio::test]
+async fn an_open_the_engine_dies_in_adopts_the_revived_container() {
+    let root = std::env::temp_dir().join(format!("oj-revive-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let flag = root.join("died-once");
+    let plugins = root.join("oj.plugins.mjs");
+    std::fs::write(
+        &plugins,
+        format!(
+            r#"import fs from "node:fs";
+export default [{{
+  name: "dies-once",
+  applyToEnvironment(environment) {{
+    if (environment.name === "ssr" && !fs.existsSync({flag:?})) {{
+      fs.writeFileSync({flag:?}, "");
+      const until = Date.now() + 5000;
+      while (Date.now() < until);
+    }}
+    return true;
+  }},
+  transform: {{ filter: {{ id: /\.md$/ }}, handler(code) {{ return code + " in " + this.environment.name; }} }},
+}}];
+"#
+        ),
+    )
+    .unwrap();
+    let config = serde_json::json!({
+        "config": { "root": root.display().to_string() },
+        "env": { "command": "serve", "mode": "development" },
+    })
+    .to_string();
+    let host = PluginHost::spawn_with_timeouts(
+        &root,
+        &plugins,
+        &config,
+        SpawnTimeouts {
+            probe: Some(std::time::Duration::from_millis(300)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the embedded engine spawns");
+    host.resolve_id("x", "").await.expect("a live host serves");
+    clear_respawn_spacing(&host);
+    let ssr = host
+        .open_environment_container("ssr", false, false)
+        .await
+        .expect("the open survives the engine's death");
+    let md = root.join("a.md").display().to_string();
+    assert_eq!(
+        ssr.transform("# a", &md, "").await.unwrap().code,
+        "# a in ssr"
+    );
+    assert_eq!(
+        host.core.environments.lock().unwrap().len(),
+        1,
+        "one container, the adopted one"
+    );
+}
+
+// Another caller can revive the engine between the open's failure and its
+// retry check: the revived engine reopened the container from its seed, and
+// the open adopts it instead of closing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_adopts_a_container_another_caller_revived() {
+    let root = std::env::temp_dir().join(format!("oj-revive-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let flag = root.join("died-once");
+    let plugins = root.join("oj.plugins.mjs");
+    std::fs::write(
+        &plugins,
+        format!(
+            r#"import fs from "node:fs";
+export default [{{
+  name: "dies-once",
+  applyToEnvironment(environment) {{
+    if (environment.name === "ssr" && !fs.existsSync({flag:?})) {{
+      fs.writeFileSync({flag:?}, "");
+      const until = Date.now() + 5000;
+      while (Date.now() < until);
+    }}
+    return true;
+  }},
+  transform: {{ filter: {{ id: /\.md$/ }}, handler(code) {{ return code + " in " + this.environment.name; }} }},
+}}];
+"#
+        ),
+    )
+    .unwrap();
+    let config = serde_json::json!({
+        "config": { "root": root.display().to_string() },
+        "env": { "command": "serve", "mode": "development" },
+    })
+    .to_string();
+    let host = PluginHost::spawn_with_timeouts(
+        &root,
+        &plugins,
+        &config,
+        SpawnTimeouts {
+            probe: Some(std::time::Duration::from_millis(300)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the embedded engine spawns");
+    host.resolve_id("x", "").await.expect("a live host serves");
+    clear_respawn_spacing(&host);
+    // The other caller: revives the engine the moment it is declared gone.
+    let reviver = {
+        let host = std::sync::Arc::clone(&host);
+        let mut gone = host.host_gone_updates();
+        tokio::spawn(async move {
+            let _ = gone.wait_for(|g| *g).await;
+            let _ = host.resolve_id("x", "").await;
+        })
+    };
+    let ssr = host
+        .open_environment_container("ssr", false, false)
+        .await
+        .expect("the open adopts the revived container");
+    reviver.await.unwrap();
+    let md = root.join("a.md").display().to_string();
+    assert_eq!(
+        ssr.transform("# a", &md, "").await.unwrap().code,
+        "# a in ssr"
+    );
+}
+
+// A revive held back by the respawn spacing fails a call at once: an open the
+// engine dies in waits for the revive instead of spinning on retries, and
+// still adopts the revived container.
+#[tokio::test]
+async fn an_open_waits_out_a_held_back_revive_without_spinning() {
+    let root = std::env::temp_dir().join(format!("oj-revive-spacing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let flag = root.join("wedged-once");
+    let plugins = root.join("oj.plugins.mjs");
+    std::fs::write(
+        &plugins,
+        format!(
+            r#"import fs from "node:fs";
+export default [{{
+  name: "wedges-once",
+  applyToEnvironment(environment) {{
+    if (environment.name === "ssr" && !fs.existsSync({flag:?})) {{
+      fs.writeFileSync({flag:?}, "");
+      const until = Date.now() + 1500;
+      while (Date.now() < until);
+    }}
+    return true;
+  }},
+}}];
+"#
+        ),
+    )
+    .unwrap();
+    let config = serde_json::json!({
+        "config": { "root": root.display().to_string() },
+        "env": { "command": "serve", "mode": "development" },
+    })
+    .to_string();
+    let host = PluginHost::spawn_with_timeouts(
+        &root,
+        &plugins,
+        &config,
+        SpawnTimeouts {
+            probe: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the embedded engine spawns");
+    host.resolve_id("x", "").await.expect("a live host serves");
+    // A revive just ran: the next is held back for the respawn spacing.
+    host.core.revive.lock().unwrap().last = Some(std::time::Instant::now());
+    // The open's loop runs on this thread (a current-thread runtime), so this
+    // thread's CPU is the wait's, whatever other tests run alongside.
+    let cpu = || {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+    };
+    let (cpu0, wall0) = (cpu(), std::time::Instant::now());
+    host.open_environment_container("ssr", false, false)
+        .await
+        .expect("the open adopts the container once the revive is allowed");
+    let (spent, waited) = (cpu() - cpu0, wall0.elapsed().as_secs_f64());
+    assert!(
+        waited >= 3.0,
+        "the spacing held the revive back ({waited:.1}s)"
+    );
+    assert!(
+        spent < waited / 2.0,
+        "{spent:.1}s of CPU over {waited:.1}s: the wait spun"
+    );
+}
+
 // A revived engine resets the gates to fail-open, then fetches the plan
 // again: the hooks are gated by their filters on the new generation too.
 #[tokio::test]
@@ -270,7 +538,7 @@ async fn a_revived_host_gates_by_the_plugins_filters_again() {
         "env": { "command": "serve", "mode": "development" },
     })
     .to_string();
-    let host = PluginHost::spawn_lazy(&root, &plugins, &config, None)
+    let host = PluginHost::spawn(&root, &plugins, &config, None)
         .await
         .expect("the embedded engine spawns");
     host.build_hook_plan().await;
@@ -921,7 +1189,7 @@ async fn plugin_env_writes_and_cwd_stay_inside_the_host_shadow() {
         "env": { "command": "serve", "mode": "development" },
     })
     .to_string();
-    let host = PluginHost::spawn_lazy(&root, &plugins, &config, None)
+    let host = PluginHost::spawn(&root, &plugins, &config, None)
         .await
         .expect("the embedded engine spawns");
     let delta = host.env_delta().await;
@@ -983,7 +1251,7 @@ return null;
         "env": { "command": "serve", "mode": "development" },
     })
     .to_string();
-    let host = PluginHost::spawn_lazy(&root, &plugins, &config, None)
+    let host = PluginHost::spawn(&root, &plugins, &config, None)
         .await
         .expect("the embedded engine spawns");
     let (a, b, c, d) = tokio::join!(
@@ -1030,7 +1298,7 @@ server.restart();
         "env": { "command": "serve", "mode": "development" },
     })
     .to_string();
-    let host = PluginHost::spawn_lazy(&root, &plugins, &config, None)
+    let host = PluginHost::spawn(&root, &plugins, &config, None)
         .await
         .expect("the embedded engine spawns");
     let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel(16);
@@ -1205,6 +1473,7 @@ fn merge_adopts_only_unset_fields() {
         html: None,
         active_plugins: None,
         stylex: None,
+        resolve_error: None,
     };
     merge_vite_values(&mut config, v);
     assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1254,6 +1523,7 @@ fn merge_never_overrides_config() {
         html: None,
         active_plugins: None,
         stylex: None,
+        resolve_error: None,
     };
     merge_vite_values(&mut config, v);
     assert_eq!(config.base.as_deref(), Some("/oj-base/"));

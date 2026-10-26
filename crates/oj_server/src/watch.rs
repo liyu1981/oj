@@ -360,6 +360,117 @@ pub fn unregister_child(pid: u32) {
     child_groups::unregister(pid);
 }
 
+/// A dev server's restarts: what the next boot starts from (the app root,
+/// the CLI's `--config`, the dev mode, whether it is a Start app) and the
+/// restart being checked.
+pub struct Restarter {
+    pub(crate) root: PathBuf,
+    pub(crate) config_file: Option<PathBuf>,
+    pub(crate) mode: String,
+    pub(crate) start: bool,
+    /// A check is running; the newest reason asked for meanwhile.
+    pending: Mutex<(bool, Option<String>)>,
+}
+
+impl Restarter {
+    pub(crate) fn new(
+        root: PathBuf,
+        config_file: Option<PathBuf>,
+        mode: String,
+        start: bool,
+    ) -> Self {
+        Self {
+            root,
+            config_file,
+            mode,
+            start,
+            pending: Mutex::new((false, None)),
+        }
+    }
+
+    /// Restart the dev server, as Vite's `server.restart()` does: the new
+    /// server is checked first, off the caller's thread (a config evaluation
+    /// can take as long as it takes, and the running server keeps serving
+    /// meanwhile), and a failing one keeps the running server, logging why. A
+    /// request arriving during a check runs after it, with the newest reason.
+    pub fn request(self: &Arc<Self>, reason: &str) {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.1 = Some(reason.to_string());
+            if pending.0 {
+                return;
+            }
+            pending.0 = true;
+        }
+        let this = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            let reason = {
+                let mut pending = this.pending.lock().unwrap();
+                match pending.1.take() {
+                    Some(reason) => reason,
+                    None => {
+                        pending.0 = false;
+                        return;
+                    }
+                }
+            };
+            match this.failure() {
+                // Vite's restart loops while requests are pending: one that
+                // came during this check is checked before the exec.
+                None if this.pending.lock().unwrap().1.is_some() => {}
+                Some(error) => {
+                    eprintln!("{} {error}", oj_brand());
+                    eprintln!("{} server restart failed", oj_brand());
+                    oj_diag::emit(
+                        oj_diag::Event::new(
+                            oj_diag::Kind::Restart,
+                            format!("server restart failed: {error}"),
+                        )
+                        .warn(),
+                    );
+                }
+                None => restart_process(&reason),
+            }
+        });
+    }
+
+    /// Why the dev server a restart would boot fails to start, as far as Vite's
+    /// createServer would: the vite.config does not load, or (outside Start, which
+    /// tolerates a framework config's hook failures per plugin) the app's Vite
+    /// cannot resolve it. The evaluation is fresh, as Vite's restartServer
+    /// resolves again, and the next boot's own (it is cached).
+    pub(crate) fn failure(&self) -> Option<String> {
+        let check = self;
+        let Some(crate::plugins::PluginSource::ViteConfig(vite)) =
+            crate::plugins::plugin_source(&check.root, check.config_file.as_deref())
+        else {
+            return None;
+        };
+        let values = crate::plugins::reextract_vite_values(
+            &check.root,
+            check.config_file.as_deref(),
+            "serve",
+            &check.mode,
+        );
+        match values {
+            None => Some(format!("failed to load config from {}", vite.display())),
+            Some((values, changed)) => {
+                // The next boot reads this evaluation from the cache, so it
+                // cannot tell the config changed: when it did, the deps
+                // pre-seed it keys must run again.
+                if changed {
+                    crate::preseed::forget_stamp(&check.root);
+                }
+                if check.start {
+                    None
+                } else {
+                    values.resolve_error
+                }
+            }
+        }
+    }
+}
+
 pub fn restart_process(reason: &str) -> ! {
     if let Some(hook) = RESTART_HOOK.get() {
         hook(reason);
@@ -975,16 +1086,20 @@ fn handle_batch(
     // Vite does, naming the file relative to the launch dir as Vite's
     // "<file> changed, restarting server" does. Vite restarts from
     // handleHMRUpdate, so not with `server.hmr: false`.
+    let restarts =
+        |p: &PathBuf| is_restart_trigger(&state.restart_files, p) || is_config_dependency(p);
     if let Some(file) = paths
         .iter()
         .filter(|_| state.hmr_enabled)
-        .find(|p| is_restart_trigger(&state.restart_files, p) || is_config_dependency(p))
+        .find(|p| restarts(p))
     {
         let shown = STARTUP_CWD
             .get()
             .and_then(|cwd| pathdiff::diff_paths(file, cwd))
             .unwrap_or_else(|| file.clone());
-        restart_process(&format!("{} changed", shown.display()));
+        state
+            .restarter
+            .request(&format!("{} changed", shown.display()));
     }
     // Vite's reloadOnTsconfigChange: clear caches, full reload. The compile
     // key folds class-field semantics in, so stale persistent-cache entries
@@ -1006,11 +1121,15 @@ fn handle_batch(
         state.tailwind_sheets.invalidate();
         crate::hmr::drop_resolver_misses(state, paths, created);
     }
+    // Vite's handleHMRUpdate ends at a restart trigger: no hot update hook
+    // and nothing to the browser for it (its watchChange still runs).
+    let hot: Vec<PathBuf> = paths.iter().filter(|p| !restarts(p)).cloned().collect();
     let dispatch = state.hmr_enabled
+        && !hot.is_empty()
         && !state
             .hmr_gate
             .as_ref()
-            .is_some_and(|gate| gate.hold(state, paths, false));
+            .is_some_and(|gate| gate.hold(state, &hot, false));
     let (state, paths, created) = (Arc::clone(state), paths.to_vec(), created.clone());
     state.rt.clone().spawn(async move {
         run_watch_change(&state, &paths, &created).await;
@@ -1018,7 +1137,7 @@ fn handle_batch(
         if !dispatch {
             return;
         }
-        let messages = decide(&state, &paths, &created).await;
+        let messages = decide(&state, &hot, &created).await;
         if messages.is_empty() {
             return;
         }
@@ -1319,3 +1438,7 @@ fn add_watched(
     kept.paths.retain(|p| !excluded(p));
     !kept.paths.is_empty() && batch.add(changes, &kept)
 }
+
+#[cfg(test)]
+#[path = "watch_restart_tests.rs"]
+mod restart_tests;
