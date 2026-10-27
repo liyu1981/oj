@@ -839,16 +839,20 @@ async function loadUserResolvedViteConfig() {
   // through the first config hook instead, so the hooks see it in the config
   // but not in configEnv.
   const fileSsr = env.command === "build" ? fileConfig.build?.ssr : undefined;
+  // The plugins this resolve adds for itself.
+  const own = new Set();
   if (fileSsr) {
     fileConfig.build = { ...fileConfig.build };
     delete fileConfig.build.ssr;
-    plugins.unshift({
+    const fileBuildSsr = {
       name: "oj:file-build-ssr",
       enforce: "pre",
       config: { order: "pre", handler: () => ({ build: { ssr: fileSsr } }) },
-    });
+    };
+    own.add(fileBuildSsr);
+    plugins.unshift(fileBuildSsr);
   }
-  plugins.push({
+  const hooksDone = {
     name: "oj:config-hooks-done",
     enforce: "post",
     config: {
@@ -857,9 +861,16 @@ async function loadUserResolvedViteConfig() {
         phase.hidden = true;
       },
     },
-  });
+  };
+  own.add(hooksDone);
+  plugins.push(hooksDone);
   try {
-    return await viteResolve(vite, inlineMerge(vite)(fileConfig, cliInlineConfig()), plugins);
+    const rc = await viteResolve(vite, inlineMerge(vite)(fileConfig, cliInlineConfig()), plugins);
+    // oj's own plugins leave the resolved config, absent as from the app's
+    // own resolve: Vite hashes the plugin names into each deps optimizer's
+    // configHash, and the preseed child's metadata was hashed without them.
+    if (rc) withoutPlugins(rc, (p) => own.has(p));
+    return rc;
   } finally {
     for (const restore of restores) {
       try {
@@ -867,6 +878,15 @@ async function loadUserResolvedViteConfig() {
       } catch {}
     }
   }
+}
+// `rc` (a resolved config) without the plugins `drop` matches, in place.
+function withoutPlugins(rc, drop) {
+  const kept = (list) => {
+    if (!Array.isArray(list)) return;
+    for (let i = list.length - 1; i >= 0; i--) if (drop(list[i])) list.splice(i, 1);
+  };
+  kept(rc.plugins);
+  for (const options of Object.values(rc.environments ?? {})) kept(options?.plugins);
 }
 // A replay resolve: the app's Vite over `plugins`, each answering what its
 // hooks did the first time, under the same inline config.

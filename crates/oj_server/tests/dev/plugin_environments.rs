@@ -805,3 +805,65 @@ export default {
         );
     }
 }
+
+// A runner environment's config lists the app's plugins, as the app's own Vite
+// resolve does: never the ones oj's recording resolve adds for itself. Vite
+// hashes these names into the environment's deps optimizer configHash, so one
+// left in made the dev server throw the preseed child's deps cache away and
+// optimize again in process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runner_environment_sees_only_the_apps_plugins() {
+    crate::require_fixture!("vite");
+    let config = r#"import { DevEnvironment } from "vite";
+let seen = null;
+const runner = {
+  name: "runner-env",
+  config() {
+    return {
+      environments: {
+        worker: {
+          consumer: "server",
+          dev: {
+            createEnvironment(name, config) {
+              const environment = new DevEnvironment(name, config, { hot: true });
+              // What the optimizer's configHash reads.
+              seen = environment.config.plugins.map((p) => p.name);
+              return environment;
+            },
+          },
+        },
+      },
+    };
+  },
+  configureServer(server) {
+    server.middlewares.use((req, res, next) => {
+      if (req.url !== "/__plugins") return next();
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(seen));
+    });
+  },
+};
+export default { plugins: [runner] };
+"#;
+    let app = App::new(&[
+        (
+            "package.json",
+            r#"{"name":"runner-env-plugins","private":true,"type":"module"}"#,
+        ),
+        ("index.html", INDEX_HTML),
+        ("src/main.js", "window.__ok = 1;\n"),
+        ("vite.config.mjs", config),
+    ]);
+    app.link_fixture("vite");
+    let server = app.serve().await;
+    crate::plugin_middleware::middleware_ready(&server).await;
+    let seen: Vec<String> = serde_json::from_str(&server.text("/__plugins").await).unwrap();
+    assert!(
+        seen.iter().any(|p| p == "runner-env"),
+        "the worker environment's config lists the app's plugins: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p == "oj:config-hooks-done"),
+        "oj's marker is in the worker environment's plugins: {seen:?}"
+    );
+}
