@@ -8,10 +8,13 @@ name: release
 # crates.io Trusted Publishing (OIDC): each crate lists this repo+workflow as
 # a publisher, and the auth action mints a run-scoped token — no stored
 # secret. A crate's very first publish cannot be trust-configured yet; do
-# that one manually with a scoped token, then it joins the flow.
+# that one manually with a scoped token, then it joins the flow. A manual
+# run (workflow_dispatch) only builds and checks the oj binaries: no release,
+# no publish, no upload.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,6 +22,8 @@ permissions:
 jobs:
   release:
     name: github release
+    # publish and snapshot-pin need this job, so a manual run skips them too.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -89,6 +94,87 @@ jobs:
         # same wall the manual fork publishes always hit); ci.yml on main is
         # the build gate.
         run: cargo publish --workspace --locked --no-verify
+
+  # oj binaries for consumers that cannot run nix, such as Bazel remote
+  # executors, which fetch them by sha256 (the API's asset digest). rusty_v8
+  # ships no musl archive, so Linux builds link glibc dynamically and build on
+  # Ubuntu 22.04: they run on glibc 2.35 and newer.
+  oj-binaries:
+    name: oj binary (${{ matrix.target }})
+    needs: release
+    # Also on a manual run, where release is skipped.
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The fat-LTO link outgrows a 16GB runner and the kernel kills rustc
+      # (see nix.yml); swap lets it finish.
+      - name: add swap
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo fallocate -l 24G /swap-oj
+          sudo chmod 600 /swap-oj
+          sudo mkswap /swap-oj
+          sudo swapon /swap-oj
+      # libsqlite3-sys runs bindgen, which needs libclang (flake.nix's
+      # bindgenHook); the arm runner image doesn't carry it.
+      - name: install build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake pkg-config
+      # No rust-cache: a tag run restores only main's caches, which never hold
+      # these keys, and its saves would evict the ones main's CI relies on.
+      - name: build
+        # lcms2-sys links a system lcms2 whenever pkg-config finds one.
+        env:
+          LCMS2_STATIC: "1"
+        run: |
+          cargo build --release --locked -p oj
+          df -h .
+      - name: package
+        id: package
+        run: |
+          out="oj-${{ matrix.target }}.tar.gz"
+          ./target/release/oj --version
+          # Fail on a runner or Homebrew library (lcms2-sys and libz-sys link
+          # one when pkg-config finds it) that consumers would not have.
+          if [ "$RUNNER_OS" = Linux ]; then
+            ldd target/release/oj | tee /dev/stderr \
+              | grep -vE '^\s*(linux-vdso|/lib(64)?/ld-linux|lib(c|m|dl|pthread|rt|gcc_s|z)\.so)' \
+              && { echo "unexpected shared library" >&2; exit 1; } || true
+          else
+            otool -L target/release/oj | tail -n +2 | tee /dev/stderr \
+              | grep -vE '^\s*(/usr/lib/|/System/Library/)' \
+              && { echo "unexpected shared library" >&2; exit 1; } || true
+          fi
+          tar -czf "$out" -C target/release oj
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+      - name: attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.file }}
+      - name: upload to this release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload --clobber "$GITHUB_REF_NAME" "${{ steps.package.outputs.file }}"
 
   # The pinned V8 snapshot bundle (issue #211): snapshot creation is
   # run-nondeterministic, so reproducible nix builds consume a prebuilt bundle
