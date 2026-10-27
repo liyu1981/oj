@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TanStack Start's server function resolver imports each function's module when it is first called, as Start's own resolver does. Its static imports formed a cycle through `@tanstack/react-start/server`, and a warm restart of an app whose middleware imports it answered every SSR request with a 500 (`Cannot access ... before initialization`).
 - A plugin whose `buildStart` throws is named in the log on every dev path, the plugin host's included.
 - Deleting or creating `src/start.ts` restarts the dev server without evaluating the config again, so the old server's route generator never writes the old route tree back over the new one. After a failed config check the restart is still checked.
+- The plugin host no longer re-optimizes the server deps the preseed child just optimized. oj's own resolve-time plugins stayed in the resolved config, and Vite hashes plugin names into the deps optimizer's config hash, so every cold boot of a Cloudflare app optimized its server deps a second time in process. The replay of the last session's deps keeps only ids Vite's include resolver reaches from the root (no more "Failed to resolve dependency" warnings for deps of workspace packages), and the child commits those workspace-only deps through the file Vite recorded for them, so the dev server does not optimize them again.
 
 ## [0.2.46] - 2026-10-25
 
