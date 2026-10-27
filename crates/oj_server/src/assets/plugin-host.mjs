@@ -353,7 +353,9 @@ function ctl(obj) {
 // flips the wedge evidence (releasing e.g. the Start prewarm hold) — the
 // last stage's name doubles as the diagnosis of WHERE the boot hangs. Not
 // timer-driven on purpose: a heartbeat would keep ticking through a hang
-// that leaves the event loop alive and defeat the evidence.
+// that leaves the event loop alive and defeat the evidence. One exception,
+// bootPreseedDone: each tick follows Rust's answer that the boot-time deps
+// pre-seed still runs, and that child has a kill deadline of its own.
 let ojInitDone = false;
 const initStage = (stage) => {
   if (!ojInitDone) ctl({ ojInitProgress: stage });
@@ -2795,6 +2797,9 @@ async function buildEnvironments(server) {
     // fields, and the manifest plugin bound to these environments reads them
     // at load time.
     coerceBundledDevOff(rc);
+    // The boot-time deps pre-seed runs alongside this host's start: the
+    // snapshot below and the deps caches the environments load are its output.
+    await bootPreseedDone();
     // BEFORE the environments are built: include must be in the config the
     // optimizer hashes, or the preseed child's metadata cannot validate.
     foldIncludeSnapshot(rc, initial.preseedIncludePath);
@@ -2926,6 +2931,22 @@ function discoveredBrowserHash(metadata) {
     )
     .digest("hex")
     .substring(0, 8);
+}
+// Until the dev server's boot-time deps pre-seed is over (preseed.rs), polled
+// over the synchronous bridge: the host is still in its top-level init, so a
+// milestone each second keeps the stall monitor from reading the wait as a
+// wedge (the pre-seed's own kill bounds it).
+async function bootPreseedDone() {
+  hostPhase("waiting for the deps pre-seed");
+  try {
+    for (let polls = 0; bundleRpc("preseedBootDone", []) === false; polls++) {
+      if (polls % 20 === 0) initStage("deps-pre-seed");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: deps pre-seed wait failed: ${(e && e.message) || e}\n`);
+  }
+  hostPhase("deps pre-seed over");
 }
 // One batch of setup-time registrations: the child optimizes them, then each
 // optimizer reads the metadata it committed; a failed child leaves them to

@@ -11,6 +11,8 @@
 //!   configureServer) are optimized by a child;
 //! - the dev server hashes the config the child hashed (Vite's configHash),
 //!   so it loads the child's cache instead of optimizing again in process;
+//! - the plugin host starts while the child runs, and builds its
+//!   environments only once the child is done;
 //! - the next session's replay names only the deps Vite's include resolver
 //!   reaches from the app's root, and a dep only a workspace package's own
 //!   node_modules holds is committed by the child through the file it
@@ -52,6 +54,14 @@ fn prepare(root: &Path) {
             "    cloudflare({ viteEnvironment: { name: \"ssr\" } }),\n    tanstackStart(",
             1,
         )
+        // The child's ssr optimizer build, slowed (OJ_PRESEED_REPORT is the
+        // child's alone, so the dev server's own optimizer runs at speed):
+        // the host reaches its environments while the seed still runs.
+        .replacen(
+            "    ssr: { define:",
+            "    ssr: { optimizeDeps: { rolldownOptions: { plugins: [{ name: \"slow-seed\", buildStart: () => process.env.OJ_PRESEED_REPORT && new Promise((r) => setTimeout(r, 2000)) }] } }, define:",
+            1,
+        )
         .replacen(
             "export default defineConfig({",
             &format!(
@@ -61,7 +71,9 @@ fn prepare(root: &Path) {
             1,
         );
     assert!(
-        config.contains("cloudflare(") && config.contains("cacheDir:"),
+        config.contains("cloudflare(")
+            && config.contains("cacheDir:")
+            && config.contains("slow-seed"),
         "the fixture's vite.config.ts changed shape; update this test"
     );
     std::fs::write(root.join("vite.config.ts"), config).unwrap();
@@ -140,6 +152,17 @@ fn after_seed(log: &str) -> &str {
     &log[at..]
 }
 
+/// When oj (or its plugin host) logged boot phase `label`, in epoch ms.
+fn phase(log: &str, label: &str) -> u128 {
+    log.lines()
+        .filter_map(|l| l.strip_prefix("[oj-phase] "))
+        .find_map(|l| {
+            let (ms, rest) = l.split_once(' ')?;
+            (rest == label).then(|| ms.parse().ok()).flatten()
+        })
+        .unwrap_or_else(|| panic!("no boot phase {label:?}:\n{log}"))
+}
+
 /// One `oj dev` session serving `/`, with oj's cache under `cache`: the test
 /// reads the stamp and the include snapshot there.
 fn boot(root: &Path, cache: &Path) -> Server {
@@ -150,6 +173,7 @@ fn boot(root: &Path, cache: &Path) -> Server {
             ("WRANGLER_SEND_METRICS", "false"),
             ("CI", "1"),
             ("NO_COLOR", "1"),
+            ("OJ_BOOT_PHASES", "1"),
         ],
     );
     // Any answer: the render discovers the workspace package's import.
@@ -208,6 +232,21 @@ fn the_dev_server_never_optimizes_what_the_preseed_child_seeded() {
             rehashed.is_empty(),
             "the dev server rejected the child's deps cache:\n{}",
             rehashed.join("\n")
+        );
+        // The host starts alongside the seed and reaches its environments
+        // while the seed still runs; only building them waits.
+        let seeded = phase(&log, "deps preseed done");
+        assert!(
+            phase(&log, "plugin host spawning") < seeded,
+            "the plugin host waited for the whole seed to start:\n{log}"
+        );
+        assert!(
+            phase(&log, "waiting for the deps pre-seed") < seeded,
+            "the host reached its environments only after the seed was over:\n{log}"
+        );
+        assert!(
+            phase(&log, "deps pre-seed over") >= seeded,
+            "the plugin host built its environments before the seed was over:\n{log}"
         );
     }
 
