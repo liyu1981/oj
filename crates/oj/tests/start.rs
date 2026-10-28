@@ -26,6 +26,31 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 const FEATURES: &[(&str, &str)] = &[
     ("#lib alias (shout)", "HOME!"),
     ("pre plugin load of an image query", "image-variant:64"),
+    (
+        "pre plugin resolveId of a bare query import",
+        "fixture-sheet-url-ok",
+    ),
+    (
+        "a plugin's file answer keeps its own query",
+        "query-file-answer-ok",
+    ),
+    (
+        "a plugin's claim wins over an installed package",
+        "installed-package-claimed-ok",
+    ),
+    (
+        "a plugin's claim wins over an existing relative file",
+        "relative-file-claimed-ok",
+    ),
+    (
+        "a /-prefixed query import reaches the pre hooks",
+        "slash-claimed-ok",
+    ),
+    (
+        "a claim of the bare id leaves the ?raw import",
+        "bare-claim-kept-raw-ok",
+    ),
+    ("a plugin's remote URL answer", "remote-answer-ok"),
     ("server function ran", "server-fn-marker"),
     ("cloudflare wrangler var", "fixture-edition"),
     ("tsconfig paths alias", "ALIAS!"),
@@ -100,6 +125,12 @@ fn assert_app(label: &str, server: &Server) {
         !home.contains("STALE_ON_DISK"),
         "{label}: plugin load() did not override on-disk stale.js (fs read won)"
     );
+    // A plugin that claims only `react/package.json` never takes its `?raw`
+    // import (Vite resolves the import once, as written).
+    assert!(
+        !home.contains("bare-claim-took-the-raw-import"),
+        "{label}: a claim of the bare id took the ?raw import"
+    );
     assert!(
         !home.contains("BUILDSTART_SKIPPED"),
         "{label}: plugin load() ran before buildStart (compiled state missing)"
@@ -143,6 +174,27 @@ fn dev_renders_every_fixture_feature() {
     };
     let dev = Server::oj_dev(&app.0);
     assert_app("dev", &dev);
+    // The remote URL a plugin answered reached the host as is: an `https:`
+    // module it stubs, never fetched nor resolved as a package.
+    assert!(
+        dev.output()
+            .contains("no SSR module for the 'https:' scheme"),
+        "the remote answer was not handed to the host:\n{}",
+        dev.output()
+    );
+    // A resolveId hook that throws fails its import, as Vite's import analysis
+    // rethrows; the server keeps serving.
+    let (status, page) = get(&dev, "/resolve-error");
+    assert!(
+        status >= 500 && page.contains("fixture resolveId hook threw"),
+        "a throwing hook did not fail the import with its error (status {status}):\n{page}"
+    );
+    // Past a skipped hook, the import would go on as a package name.
+    assert!(
+        !page.contains("resolved-without-throwing") && !page.contains("Could not find package"),
+        "the import went on past the throwing hook:\n{page}"
+    );
+    assert_eq!(get(&dev, "/about").0, 200, "{}", dev.output());
 }
 
 #[test]

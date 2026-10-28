@@ -69,6 +69,83 @@ function imageVariantPlugin(): Plugin {
   };
 }
 
+// A `pre` resolveId that answers a bare import by its query, as a package's
+// `styles.css?url` plugin does: it must see the query, in SSR as in the browser.
+function sheetUrlPlugin(): Plugin {
+  const RESOLVED = "\0fixture-sheet-url";
+  return {
+    name: "fixture-sheet-url",
+    enforce: "pre",
+    resolveId: {
+      filter: { id: /^fixture-sheet\/styles\.css\?url$/ },
+      handler() {
+        return RESOLVED;
+      },
+    },
+    load(id) {
+      if (id === RESOLVED) return `export default "fixture-sheet-url-ok";`;
+    },
+  };
+}
+
+// resolveId sees each import once, as written (Vite's import analysis): a
+// file answer keeps its own query, a claim wins over an installed package or
+// an existing file, a /-prefixed id comes to the pre hooks first, and a claim
+// of the bare id alone never takes the queried import.
+// In the dev server render only (the client and the build take a virtual
+// module): a remote URL answer, which the Start host stubs rather than fetch,
+// and a hook that throws, which fails its import.
+function devSsrAnswersPlugin(): Plugin {
+  let serve = false;
+  return {
+    name: "fixture-dev-ssr-answers",
+    enforce: "pre",
+    configResolved(config) {
+      serve = config.command === "serve";
+    },
+    resolveId(id, _importer, options) {
+      const devSsr = serve && (options?.ssr || this.environment?.config?.consumer === "server");
+      if (id === "fixture-remote/x.css?url") {
+        return devSsr ? "https://cdn.example/x.css" : "\0fixture-remote";
+      }
+      if (id === "fixture-throws/x.css?url") {
+        if (devSsr) throw new Error("fixture resolveId hook threw");
+        return "\0fixture-throws";
+      }
+      return null;
+    },
+    load(id) {
+      if (id === "\0fixture-remote") return `export default "remote-client";`;
+      if (id === "\0fixture-throws") return `export default "resolved-without-throwing";`;
+    },
+  };
+}
+
+function queryClaimsPlugin(): Plugin {
+  const answer = new URL("./src/content/answer.txt", import.meta.url).pathname;
+  // Extension-free virtual ids, so no bundler types them by the import's.
+  const virtual: Record<string, [string, string]> = {
+    "react/index.js?raw": ["installed", "installed-package-claimed-ok"],
+    "../content/claimed.txt?raw": ["relative", "relative-file-claimed-ok"],
+    "/virtual-probe.txt?raw": ["slash", "slash-claimed-ok"],
+  };
+  const byId = new Map(Object.values(virtual).map(([key, text]) => [`\0query-claim-${key}`, text]));
+  return {
+    name: "fixture-query-claims",
+    enforce: "pre",
+    resolveId(id) {
+      if (id === "fixture-missing/notes.txt?raw") return `${answer}?raw`;
+      if (id in virtual) return `\0query-claim-${virtual[id][0]}`;
+      if (id === "react/package.json") return "\0bare-file-claim";
+      return null;
+    },
+    load(id) {
+      if (byId.has(id)) return `export default ${JSON.stringify(byId.get(id))};`;
+      if (id === "\0bare-file-claim") return `export default "bare-claim-took-the-raw-import";`;
+    },
+  };
+}
+
 // Echoes a page's import.meta.hot.send back to it (server.ws.on -> send).
 function wsEchoPlugin(): Plugin {
   return {
@@ -97,6 +174,9 @@ export default defineConfig({
     buildInfoPlugin(),
     freshModulePlugin(),
     imageVariantPlugin(),
+    sheetUrlPlugin(),
+    queryClaimsPlugin(),
+    devSsrAnswersPlugin(),
     wsEchoPlugin(),
     // .mdx before react/tanstack so its output is plain JSX for them to handle.
     mdx(),
