@@ -145,6 +145,25 @@ pub struct EnvResolvers {
     /// Vite's `isProduction` (`NODE_ENV=production`), which maps the
     /// `development|production` condition.
     pub production: bool,
+    /// The client's pre-bundle for a bare import, as vite:resolve's
+    /// tryOptimizedResolve answers it (see [`PluginHost::set_optimized_dep`]).
+    pub optimized_dep: std::sync::OnceLock<OptimizedDep>,
+}
+
+/// (bare source, its importer's directory, the file the client resolver found)
+/// to what answers it: see [`OptimizedAnswer`].
+pub type OptimizedDep = Box<dyn Fn(&str, &Path, &Path) -> OptimizedAnswer + Send + Sync>;
+
+/// vite:resolve's tryOptimizedResolve for a bare import.
+pub enum OptimizedAnswer {
+    /// This id answers instead of the file: the pre-bundle's, or the file
+    /// versioned with the browser hash when it skips optimization.
+    Id(String),
+    /// The file stands.
+    File,
+    /// The dependency scan has not settled: tryOptimizedResolve awaits
+    /// `scanProcessing` before it answers, so the caller waits and asks again.
+    ScanPending,
 }
 
 /// An environment's resolved resolve options and consumer, as the plugin host
@@ -241,6 +260,15 @@ impl EnvResolverSlot {
             .get(name)
             .and_then(|r| r.server)
             .unwrap_or(name != "client")
+    }
+
+    /// What answers bare `source` that resolved to `file` (see
+    /// [`OptimizedAnswer`]); the file when the dev server set no lookup.
+    pub(crate) fn optimized_dep(&self, source: &str, dir: &Path, file: &Path) -> OptimizedAnswer {
+        match self.base.get().and_then(|base| base.optimized_dep.get()) {
+            Some(lookup) => lookup(source, dir, file),
+            None => OptimizedAnswer::File,
+        }
     }
 
     /// Drops every built resolver's cached lookups, misses included.
@@ -539,10 +567,18 @@ pub(crate) fn ctx_rpc(
 ) -> Result<serde_json::Value, String> {
     let CtxRpc { root, env, .. } = *ctx;
     let arg = |i: usize| args.get(i).and_then(|v| v.as_str()).unwrap_or("");
+    // Vite's tryNodeResolve basedir: the importer's directory when the
+    // importer is an existing absolute file, else the root (a virtual id).
     let dir_of = |path: &Path| {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.to_path_buf())
+        let file = Path::new(
+            path.to_str()
+                .and_then(|p| p.split('?').next())
+                .unwrap_or_default(),
+        );
+        match file.parent() {
+            Some(dir) if file.is_absolute() && file.exists() => dir.to_path_buf(),
+            _ => root.to_path_buf(),
+        }
     };
     // The calling environment's name and consumer ("client" or "server").
     let env_resolver =
@@ -560,11 +596,23 @@ pub(crate) fn ctx_rpc(
             } else {
                 dir_of(Path::new(importer))
             };
+            let server = arg(3) == "server";
             let own = env_resolver(arg(2), arg(3));
             let resolver = own.as_deref().unwrap_or(ctx.resolver);
-            Ok(match resolver.resolve(&dir, source) {
-                Ok(p) => serde_json::Value::String(p.display().to_string()),
-                Err(_) => serde_json::Value::Null,
+            let Ok(p) = resolver.resolve(&dir, source) else {
+                return Ok(serde_json::Value::Null);
+            };
+            // The client's deps optimizer answers for the client alone: Vite
+            // gives any other environment its own (or none).
+            let client = !server && matches!(arg(2), "client" | "");
+            let answer = match client && arg(4) == "optimize" {
+                true => ctx.resolvers.optimized_dep(source, &dir, &p),
+                false => OptimizedAnswer::File,
+            };
+            Ok(match answer {
+                OptimizedAnswer::Id(id) => serde_json::Value::String(id),
+                OptimizedAnswer::File => serde_json::Value::String(p.display().to_string()),
+                OptimizedAnswer::ScanPending => serde_json::json!({ "scanPending": true }),
             })
         }
         "moduleInfo" => {
@@ -1133,6 +1181,39 @@ impl PluginHost {
         self.call("resolveId", &[source, importer]).await
     }
 
+    /// The resolveId chain cut to the plugins Vite runs before its own
+    /// resolver (`enforce: "pre"` or `order: "pre"`).
+    pub async fn resolve_id_pre(
+        &self,
+        source: &str,
+        importer: &str,
+        aliased: Option<&str>,
+    ) -> Result<Option<crate::PreAnswer>, String> {
+        // The `order: "pre"` hooks see the specifier as written; the alias
+        // plugin then resolves an aliased one again (all the pre hooks on
+        // it), else the `enforce: "pre"` plugins see the original.
+        let mut answer = self
+            .resolve_id_phase(source, importer, "pre-ordered", false)
+            .await?;
+        if answer.is_none() {
+            answer = match aliased.filter(|a| *a != source) {
+                Some(aliased) => {
+                    self.resolve_id_phase(aliased, importer, "pre", false)
+                        .await?
+                }
+                None => {
+                    self.resolve_id_phase(source, importer, "pre-enforced", false)
+                        .await?
+                }
+            };
+        }
+        Ok(answer.map(|r| crate::PreAnswer {
+            external: r.external.is_some(),
+            id: r.id,
+            resolver: false,
+        }))
+    }
+
     /// One phase of the resolveId chain for a Start bundle host: `"pre"` (the
     /// hooks Vite runs before its core resolver), `"post"` (the rest), or
     /// `"all"`. The winning result whole, `external` included.
@@ -1215,8 +1296,12 @@ impl PluginHost {
         &self,
         source: &str,
         importer: &str,
+        aliased: Option<&str>,
     ) -> Result<Option<ResolvedId>, String> {
-        let raw = self.call("scanResolveId", &[source, importer]).await?;
+        let aliased = aliased.unwrap_or("");
+        let raw = self
+            .call("scanResolveId", &[source, importer, aliased])
+            .await?;
         Ok(raw
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| ResolvedId::from_json(&v)))
@@ -1608,6 +1693,14 @@ impl PluginHost {
         self.call_flag("getHasResolveId", true).await
     }
 
+    /// The `pre` resolveId hooks' `filter.id` patterns, empty when there is no
+    /// such hook; `None` when one takes every id, or on RPC failure.
+    pub async fn pre_resolve_id_filters(&self) -> Option<Vec<HookFilter>> {
+        let pats: Option<Vec<serde_json::Value>> =
+            serde_json::from_str(&self.call_ok("getPreResolveIdFilters").await?).ok()?;
+        Some(pats?.iter().map(HookFilter::from_json).collect())
+    }
+
     /// Whether any active plugin has a `load` hook (Vite runs load before the fs
     /// read). Defaults to false on RPC failure (the fs read alone is always correct).
     pub async fn has_load(&self) -> bool {
@@ -1982,6 +2075,14 @@ impl PluginHost {
     /// [`crate::hmr::drop_resolver_misses`]).
     pub fn clear_environment_resolvers(&self) {
         self.core.boot.resolvers.clear_caches()
+    }
+
+    /// The client pre-bundle lookup, set once the dev server's deps exist;
+    /// a no-op before [`Self::set_resolvers`].
+    pub fn set_optimized_dep(&self, lookup: OptimizedDep) {
+        if let Some(r) = self.core.boot.resolvers.base.get() {
+            let _ = r.optimized_dep.set(lookup);
+        }
     }
 
     pub fn set_ws_sender(&self, tx: tokio::sync::broadcast::Sender<String>) {
