@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A plugin's `this.resolve` and `this.load` resolve with the calling environment's own options, as Vite builds its resolve plugin per environment: a package's `browser` field no longer wins in a server-side render. The transforming module's own imports, any other specifier, and the `importedIds` of a module `this.load` reads from disk all resolved the client way before, and the last two ignored the app's `resolve` options (aliases, conditions, main fields) in every environment. Each environment takes its own `resolve.conditions` and `resolve.mainFields` from Vite's resolved config: a custom server environment no longer borrows the ssr environment's, a runner-backed ssr environment's plugins see its own conditions, and `ssr.target: "webworker"` keeps the client defaults.
+
 ## [0.2.49] - 2026-10-28
 
 ### Fixed
