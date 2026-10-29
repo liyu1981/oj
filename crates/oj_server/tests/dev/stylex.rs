@@ -658,3 +658,68 @@ async fn a_relative_base_or_unknown_dev_mode_still_boots() {
         .await
         .contains("color: red"));
 }
+
+// A runner environment (a plugin's dev.createEnvironment, the Cloudflare
+// shape) runs through the app's own Vite in the plugin host: its modules get
+// the plugin's transform there, as every environment's do under Vite, from
+// its boot-time imports on (Cloudflare's configureServer loads the worker),
+// and their rules feed the same sheet, leaving it with the module's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runner_environments_modules_compile_and_feed_the_sheet() {
+    require_fixture!("vite");
+    let app = app("{}");
+    app.write(&[
+        (
+            "src/worker.ts",
+            "import * as stylex from \"@stylexjs/stylex\";\n\
+             export const s = stylex.props(stylex.create({ x: { color: \"teal\" } }).x);\n",
+        ),
+        (
+            "vite.config.js",
+            "import stylex from \"@stylexjs/unplugin\";\n\
+             import { DevEnvironment } from \"vite\";\n\
+             let boot = null;\n\
+             const runner = {\n\
+               name: \"runner-env\",\n\
+               config: () => ({ environments: { worker: { consumer: \"server\", dev: {\n\
+                 createEnvironment: (name, config) => new DevEnvironment(name, config, { hot: true }),\n\
+               } } } }),\n\
+               async configureServer(server) {\n\
+                 const worker = server.environments.worker;\n\
+                 boot = (await worker.transformRequest(\"/src/worker.ts\"))?.code ?? \"\";\n\
+                 server.middlewares.use(async (req, res, next) => {\n\
+                   if (req.url === \"/__boot\") return res.end(boot);\n\
+                   if (req.url !== \"/__worker\") return next();\n\
+                   worker.moduleGraph.invalidateAll();\n\
+                   res.end((await worker.transformRequest(\"/src/worker.ts\"))?.code ?? \"\");\n\
+                 });\n\
+               },\n\
+             };\n\
+             export default { plugins: [stylex.vite({}), runner] };\n",
+        ),
+    ]);
+    let server = app.serve().await;
+    crate::plugin_middleware::middleware_ready(&server).await;
+    assert!(
+        server.built.plugin_serve.runner_environments(),
+        "the worker environment never came up"
+    );
+    let boot = server.text("/__boot").await;
+    assert!(boot.contains("worker__"), "{boot}");
+    assert!(!boot.contains("stylex.create"), "{boot}");
+    let css = server.text("/virtual:stylex.css").await;
+    assert!(css.contains("color: teal"), "{css}");
+
+    // Still importing StyleX, compiling nothing: its rule leaves the sheet.
+    app.write(&[(
+        "src/worker.ts",
+        "import * as stylex from \"@stylexjs/stylex\";\nexport const s = typeof stylex;\n",
+    )]);
+    let module = server.text("/__worker").await;
+    assert!(
+        module.contains("typeof ") && !module.contains("worker__"),
+        "{module}"
+    );
+    let css = server.text("/virtual:stylex.css").await;
+    assert!(!css.contains("color: teal"), "{css}");
+}
