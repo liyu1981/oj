@@ -44,6 +44,11 @@ pub struct EmitOptions<'a> {
     pub emit_only: EmitOnly,
     pub force_emit: bool,
     pub write_file: Option<WriteFile<'a>>,
+    /// oj (tools/tsrs-patches): set by the declaration signature job (`tsrs_api`'s `oj_incremental.rs`). The emit then
+    /// stops before its next file once `ctx` is cancelled, leaving the files it did not reach out of its result, and
+    /// passes each file's transform time, the part a cancel cannot interrupt, to this. Without it the emit runs to its
+    /// end as upstream's does: callers read every file's output.
+    pub oj_interruptible: Option<&'a (dyn Fn(P<SourceFile>, std::time::Duration) + Sync)>,
 }
 
 // program.go:1862
@@ -224,6 +229,7 @@ impl Program {
         // and the program's caches (`EmitHost`).
         let transform =
             |c: &mut tsrs_checker::Checker, source_file: P<SourceFile>| -> (Emitter, Region) {
+                let started = std::time::Instant::now();
                 let outer_before = if mem_log { tsrs_core::ptr::arena_used_bytes() } else { 0 };
                 let region = Region::new_scratch(EMIT_REGION_FIRST_CHUNK);
                 let e = {
@@ -271,8 +277,13 @@ impl Program {
                         outer
                     );
                 }
+                if let Some(timed) = options.oj_interruptible {
+                    timed(source_file, started.elapsed());
+                }
                 (e, region)
             };
+        // oj: only an interruptible emit stops early (`EmitOptions::oj_interruptible`).
+        let stopped = || options.oj_interruptible.is_some() && ctx.err().is_some();
         let print = |(mut e, region): (Emitter, Region), index: usize| {
             let outer_before = if mem_log { tsrs_core::ptr::arena_used_bytes() } else { 0 };
             let used_before = if mem_log { region.used_bytes() } else { 0 };
@@ -307,6 +318,9 @@ impl Program {
                 let pending = PendingPrints::default();
                 crate::program::worker_pool().in_place_scope(|scope| {
                     pool.for_each_checker_group_do(&source_files, false, |c, index, file| {
+                        if stopped() {
+                            return;
+                        }
                         let e = transform(c, file);
                         pending.acquire();
                         let (print, pending) = (&print, &pending);
@@ -318,10 +332,15 @@ impl Program {
                 });
             }
             Some(pool) => pool.for_each_checker_group_do(&source_files, true, |c, index, file| {
-                print(transform(c, file), index);
+                if !stopped() {
+                    print(transform(c, file), index);
+                }
             }),
             None => {
                 for (index, &file) in source_files.iter().enumerate() {
+                    if stopped() {
+                        break;
+                    }
                     let e = {
                         let mut guard = self.get_type_checker_for_file(ctx, file);
                         transform(&mut guard, file)
@@ -340,11 +359,12 @@ impl Program {
             );
         }
 
-        // collect results from emit, preserving input order
+        // collect results from emit, preserving input order; an interrupted emit has none for the files it did not
+        // reach (oj)
         source_files
             .into_iter()
             .zip(results)
-            .map(|(file, r)| (file, r.into_inner().unwrap().unwrap()))
+            .filter_map(|(file, r)| r.into_inner().unwrap().map(|r| (file, r)))
             .collect()
     }
 }

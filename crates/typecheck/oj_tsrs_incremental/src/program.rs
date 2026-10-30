@@ -185,6 +185,19 @@ impl Program {
     /// concurrently with anything else that uses this program or its snapshot. Returns the number of signatures
     /// stored.
     pub fn compute_placeholder_signatures(&self, ctx: &Context, chunk: usize) -> usize {
+        self.oj_compute_placeholder_signatures(ctx, chunk, &|_| false, &|_, _| {})
+    }
+
+    /// oj (tools/tsrs-patches): `compute_placeholder_signatures` without the files `skip` names (by file name), and
+    /// with each emitted file's own declaration transform time passed to `timed`. A cancel stops the emit before
+    /// its next file, not at the end of the chunk (`EmitOptions::oj_interruptible`).
+    pub fn oj_compute_placeholder_signatures(
+        &self,
+        ctx: &Context,
+        chunk: usize,
+        skip: &dyn Fn(&str) -> bool,
+        timed: &(dyn Fn(P<SourceFile>, Duration) + Sync),
+    ) -> usize {
         let snapshot = self.snapshot;
         if !snapshot.can_use_incremental_state()
             || snapshot.changed_files_set.size() != 0
@@ -200,6 +213,7 @@ impl Program {
             .filter(|&file| {
                 !file.is_declaration_file()
                     && !tsrs_ast::is_json_source_file(file)
+                    && !skip(file.file_name())
                     && snapshot
                         .file_infos
                         .load(file.path())
@@ -236,6 +250,7 @@ impl Program {
                     target_source_files: Some(files.to_vec()),
                     emit_only: EmitOnly::EmitOnlyBuilderSignature,
                     write_file: Some(&write_file),
+                    oj_interruptible: Some(timed),
                     ..Default::default()
                 },
             );

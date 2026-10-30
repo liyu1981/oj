@@ -12,13 +12,19 @@
 //! running server) usually answers from a report that is already current. A
 //! request names the files its caller changed; they are re-read before the
 //! answer, so it never depends on watcher timing.
+//!
+//! The dev server comes first: the checker opens the projects and runs its
+//! first check only once a page has been served and the server has been
+//! quiet for [`FIRST_CHECK_QUIET`] (on one CPU, a check at boot would slow
+//! the first page down). A `/@oj/typecheck` request before that opens it
+//! right away.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -39,8 +45,64 @@ const CHECKER_STACK: usize = 256 << 20;
 /// How long one check may take before its worker is replaced.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long the dev server must have answered nothing, after its first
+/// page, before the checker opens the projects and checks them.
+const FIRST_CHECK_QUIET: Duration = Duration::from_secs(1);
+
 pub(crate) struct Typecheck {
     tx: std::sync::mpsc::Sender<Msg>,
+    serving: Serving,
+}
+
+/// The dev server's requests, for the first check to wait for: how many are
+/// in flight and when the last one finished (`None` before the first).
+#[derive(Default)]
+struct Serving {
+    state: Mutex<(usize, Option<Instant>)>,
+    changed: tokio::sync::Notify,
+}
+
+impl Serving {
+    fn begin(&self) {
+        self.state.lock().unwrap().0 += 1;
+    }
+
+    fn end(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 -= 1;
+        state.1 = Some(Instant::now());
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Returns once a request has been served and none has run for `quiet`.
+    async fn first_quiet(&self, quiet: Duration) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (in_flight, last) = *self.state.lock().unwrap();
+            match last {
+                Some(last) if in_flight == 0 => {
+                    let idle = last.elapsed();
+                    if idle >= quiet {
+                        return;
+                    }
+                    tokio::time::sleep(quiet - idle).await;
+                }
+                _ => changed.await,
+            }
+        }
+    }
+}
+
+/// Ends a request's count when the request's future ends or is dropped.
+struct InFlight(Arc<Typecheck>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.serving.end();
+    }
 }
 
 enum Msg {
@@ -70,11 +132,39 @@ impl Typecheck {
                 .spawn(move || imp::run(root, rx)),
         };
         spawned.ok()?;
-        Some(Arc::new(Typecheck { tx }))
+        Some(Arc::new(Typecheck {
+            tx,
+            serving: Serving::default(),
+        }))
     }
 
-    pub(crate) fn warm(&self) {
-        let _ = self.tx.send(Msg::Warm);
+    /// Opens the projects and checks them once the dev server has served a
+    /// page and gone quiet ([`FIRST_CHECK_QUIET`]).
+    pub(crate) fn warm_after_first_serve(self: &Arc<Self>) {
+        let typecheck = Arc::clone(self);
+        tokio::spawn(async move {
+            typecheck.serving.first_quiet(FIRST_CHECK_QUIET).await;
+            let _ = typecheck.tx.send(Msg::Warm);
+        });
+    }
+
+    /// `router` with each request counted for [`Self::warm_after_first_serve`];
+    /// `/@oj/typecheck` itself waits on the checker, so it does not count.
+    pub(crate) fn count_requests(self: &Arc<Self>, router: axum::Router) -> axum::Router {
+        let typecheck = Arc::clone(self);
+        router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let counted = (req.uri().path() != "/@oj/typecheck").then(|| {
+                    typecheck.serving.begin();
+                    InFlight(Arc::clone(&typecheck))
+                });
+                async move {
+                    let response = next.run(req).await;
+                    drop(counted);
+                    response
+                }
+            },
+        ))
     }
 
     /// Forwards the watcher's events from now on.
@@ -467,7 +557,7 @@ mod imp {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use oj_typecheck::{Checker, Report};
 
@@ -476,6 +566,14 @@ mod imp {
     /// How long changes settle before a background re-check.
     const SETTLE: Duration = Duration::from_millis(150);
 
+    /// How long the checker must hear nothing (no change, no request) after
+    /// a check before it records the files' declaration signatures
+    /// (`Checker::record_signatures`). Every message slides it, as the dep
+    /// optimizer's debounce does, so a burst of edits and checks records
+    /// once, after the burst; a request that arrives while it records stops
+    /// it.
+    const SIGNATURES_QUIET: Duration = Duration::from_secs(1);
+
     pub(super) fn run(root: PathBuf, rx: Receiver<Msg>) {
         lower_priority();
         let mut state = State {
@@ -483,13 +581,23 @@ mod imp {
             checker: None,
             pending: Vec::new(),
             report: None,
+            signatures_due: None,
         };
         loop {
-            let msg = if state.pending.is_empty() {
-                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            let wait = if state.pending.is_empty() {
+                state
+                    .signatures_due
+                    .map(|due| due.saturating_duration_since(Instant::now()))
             } else {
-                rx.recv_timeout(SETTLE)
+                Some(SETTLE)
             };
+            let msg = match wait {
+                Some(wait) => rx.recv_timeout(wait),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            if msg.is_ok() && state.signatures_due.is_some() {
+                state.signatures_due = Some(Instant::now() + SIGNATURES_QUIET);
+            }
             match msg {
                 Ok(Msg::Warm) => {
                     let _ = state.answer();
@@ -507,9 +615,10 @@ mod imp {
                     state.pending.extend(changed);
                     let _ = reply.send(state.answer());
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                Err(RecvTimeoutError::Timeout) if !state.pending.is_empty() => {
                     let _ = state.answer();
                 }
+                Err(RecvTimeoutError::Timeout) => state.record_signatures(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -520,6 +629,9 @@ mod imp {
         checker: Option<Checker>,
         pending: Vec<PathBuf>,
         report: Option<Report>,
+        /// When the last check's signatures are to be recorded
+        /// (`SIGNATURES_QUIET`).
+        signatures_due: Option<Instant>,
     }
 
     impl State {
@@ -562,13 +674,25 @@ mod imp {
                 .is_none_or(|r| r.generation != checker.generation())
             {
                 self.report = Some(checker.check()?);
+                self.signatures_due = Some(Instant::now() + SIGNATURES_QUIET);
             }
             Ok(self.report.as_ref().map(answer_of))
+        }
+
+        fn record_signatures(&mut self) {
+            self.signatures_due = None;
+            if let Some(checker) = &self.checker {
+                // Its one declaration types every route: about 20 s to emit on
+                // a large app.
+                let route_tree = crate::start_route_tree(&self.root);
+                checker.record_signatures(&[route_tree]);
+            }
         }
 
         /// Drops a checker that failed; the next request opens a fresh one.
         fn reset(&mut self) {
             self.report = None;
+            self.signatures_due = None;
             self.pending.clear();
             if let Some(checker) = self.checker.take() {
                 if catch_unwind(AssertUnwindSafe(|| drop(checker))).is_err() {
@@ -629,7 +753,26 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_changed;
+    use super::{parse_changed, Serving};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn the_first_check_waits_for_a_served_request_and_then_quiet() {
+        let serving = Serving::default();
+        let quiet = Duration::from_millis(100);
+        let wait = || tokio::time::timeout(Duration::from_millis(400), serving.first_quiet(quiet));
+        assert!(wait().await.is_err(), "nothing served yet");
+        serving.begin();
+        assert!(wait().await.is_err(), "a request still in flight");
+        serving.end();
+        let started = std::time::Instant::now();
+        assert!(wait().await.is_ok(), "served, then quiet");
+        assert!(
+            started.elapsed() >= Duration::from_millis(90),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn a_request_body_names_the_changed_files() {

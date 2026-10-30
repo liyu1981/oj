@@ -182,6 +182,78 @@ fn the_typecheck_route_is_absent_without_the_flag_even_with_the_old_env() {
 }
 
 #[test]
+fn oj_typecheck_follows_edits_through_the_running_server_as_a_check_from_scratch_would() {
+    let app = App::new("follow");
+    app.write("src/main.ts", "export const n: number = 1;\n");
+    app.write("src/shape.ts", "export const shape = { size: 1 };\n");
+    app.write(
+        "src/use.ts",
+        "import { shape } from './shape';\nexport const size: number = shape.size;\n",
+    );
+    let _server = Server::oj_dev_with_args(&app.0, &["--typecheck"], &[]);
+    // A cache dir of its own: `oj typecheck` finds no server there and checks from scratch.
+    let scratch = std::env::temp_dir().join(format!("oj-tc-scratch-{}", std::process::id()));
+    let scratch_dir = scratch.to_string_lossy().into_owned();
+    let from_scratch = || oj_typecheck_with(&app.0, &[], &[("OJ_CACHE_DIR", scratch_dir.as_str())]);
+    let (code, out) = oj_typecheck(&app.0, &["--json"]);
+    assert_eq!(
+        (code, json(&out)["status"].as_str()),
+        (0, Some("ok")),
+        "{out}"
+    );
+    let mut generation = json(&out)["generation"].as_u64().unwrap();
+    let edits: &[(&str, &str)] = &[
+        // An exported type changes: the file that imports it fails.
+        ("src/shape.ts", "export const shape = { size: 'one' };\n"),
+        // The exported types stay: the importer keeps its error.
+        (
+            "src/shape.ts",
+            "export const shape = { size: 'one' };\n// note\n",
+        ),
+        (
+            "src/use.ts",
+            "import { shape } from './shape';\nexport const size: string = shape.size;\n",
+        ),
+        ("src/shape.ts", "export const shape = { size: 1 };\n"),
+        ("src/main.ts", "export const n: number = 'one';\n"),
+        ("src/main.ts", "export const n: number = 1;\n"),
+        (
+            "src/use.ts",
+            "import { shape } from './shape';\nexport const size: number = shape.size;\n",
+        ),
+    ];
+    for (k, (file, text)) in edits.iter().enumerate() {
+        app.write(file, text);
+        let (code, out) = oj_typecheck(&app.0, &["--changed", file, "--json"]);
+        let report = json(&out);
+        let next = report["generation"].as_u64().unwrap_or(0);
+        assert!(
+            next > generation,
+            "edit {k}: the server did not answer: {out}"
+        );
+        generation = next;
+        let (scratch_code, scratch_text) = from_scratch();
+        assert_eq!(
+            (code, report["text"].as_str().unwrap_or_default()),
+            (scratch_code, scratch_text.as_str()),
+            "edit {k}: {file}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn oj_typecheck_checks_in_process_beside_a_server_without_the_flag() {
+    let app = App::new("plain-server");
+    let _server = Server::oj_dev(&app.0);
+    assert!(
+        !app.0.join(".oj-cache/v1/dev-server.json").exists(),
+        "only a --typecheck server advertises its address"
+    );
+    assert_eq!(oj_typecheck(&app.0, &[]), (2, MAIN_ERROR.to_string()));
+}
+
+#[test]
 fn oj_typecheck_checks_in_process_when_no_server_answers() {
     let app = App::new("cli");
     assert_eq!(oj_typecheck(&app.0, &[]), (2, MAIN_ERROR.to_string()));
@@ -258,6 +330,33 @@ fn a_killed_checker_worker_is_replaced_and_the_dev_server_keeps_serving() {
         "{body}"
     );
     assert_eq!(server.request("GET", "/index.html", &[]).0, 200);
+}
+
+#[test]
+fn the_checker_starts_only_after_the_first_page_is_served() {
+    let app = App::new("first-serve");
+    let server = Server::oj_dev_with_args(&app.0, &["--typecheck"], &[]);
+    let pattern = format!("typecheck-worker {}", app.0.display());
+    let worker = || {
+        Command::new("pgrep")
+            .args(["-f", &pattern])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    // Listening, but nothing served: no checker competes with the first page.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(!worker(), "the checker started before any page was served");
+    assert_eq!(server.request("GET", "/index.html", &[]).0, 200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !worker() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the checker never started after the first page"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[test]
