@@ -92,6 +92,10 @@ enum Command {
         /// code-split so the first route needs only a fraction of the graph.
         #[arg(long)]
         lazy: bool,
+        /// Keep a TypeScript checker warm beside the dev server, for
+        /// `oj typecheck` and `/@oj/typecheck`.
+        #[arg(long)]
+        typecheck: bool,
     },
     Compile {
         file: PathBuf,
@@ -214,8 +218,8 @@ enum Command {
         base: Option<String>,
     },
     /// Type-check the app as `tsc -b --noEmit` would, on oj's built-in
-    /// checker. Asks the app's running dev server when it has
-    /// `OJ_TYPECHECK=1` (a warm, incremental check); otherwise checks in this
+    /// checker. Asks the app's running dev server when it runs with
+    /// `--typecheck` (a warm, incremental check); otherwise checks in this
     /// process. Exits 0 when clean, 2 on type errors, 1 when it cannot check.
     Typecheck {
         root: Option<PathBuf>,
@@ -227,7 +231,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Internal: the dev server's `OJ_TYPECHECK` checker, in a process of its
+    /// Internal: the dev server's `--typecheck` checker, in a process of its
     /// own so nothing the checker does can take the server down. Speaks JSON
     /// lines on stdin/stdout (see oj_server's typecheck module).
     #[command(name = "typecheck-worker", hide = true)]
@@ -605,6 +609,7 @@ async fn run(cli: Cli, rolldown: tokio::runtime::Handle) -> anyhow::Result<()> {
             enable_cache,
             no_cache,
             lazy,
+            typecheck,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -615,9 +620,9 @@ async fn run(cli: Cli, rolldown: tokio::runtime::Handle) -> anyhow::Result<()> {
                 }
             });
             if let Some(entry) = ssr {
-                ssr_dev::ssr_dev(root, entry, port, host, rolldown).await
+                ssr_dev::ssr_dev(root, entry, port, host, typecheck, rolldown).await
             } else if oj_server::is_tanstack_start_app(&root) {
-                start_dev::start_dev(root, port, host, config, mode, rolldown).await
+                start_dev::start_dev(root, port, host, config, mode, typecheck, rolldown).await
             } else {
                 oj_server::DevServer {
                     root,
@@ -627,6 +632,7 @@ async fn run(cli: Cli, rolldown: tokio::runtime::Handle) -> anyhow::Result<()> {
                     enable_cache,
                     no_cache,
                     lazy,
+                    typecheck,
                     mode,
                     rolldown,
                 }
