@@ -1,0 +1,124 @@
+name: prebuild
+
+# Downloadable Linux CLI binaries, so each upstream release on the fork
+# carries amd64 (x86_64) and arm64 (aarch64) glibc builds of `oj` without
+# the caller needing a Rust toolchain. Each target builds natively on a
+# matching runner rather than cross-compiling, which keeps rusty_v8's
+# prebuilt-archive selection and the native linked-v8 path exactly what
+# `cargo install oj` produces.
+#
+# A tag is the release trigger: tools/prebuild-release.sh pushes vX.Y.Z and
+# this runs the builds, then attaches the tarballs to a GitHub release of
+# the same name. The script's `prebuild` branch push only moves the ref, so
+# a sync does not start a second build. workflow_dispatch builds the
+# artifacts without touching a release.
+#
+# musl (*-linux-musl) is deliberately not built: upstream oj_deno_runtime
+# calls libc::malloc_trim, which the `libc` crate exposes only for glibc, so
+# the workspace does not compile for musl. When that is cfg-guarded (here or
+# upstream), re-add the musl matrix entries plus the musl-gcc kernel UAPI
+# headers libffi-sys needs (linux-libc-dev and
+# CFLAGS=-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      # Release, not debug: this is the artifact people download, and it is
+      # the same profile `cargo install oj --locked` builds.
+      - name: cargo build
+        run: cargo build --release --locked -p oj --target ${{ matrix.target }}
+      - name: smoke
+        run: ./target/${{ matrix.target }}/release/oj --version
+      - name: package
+        run: |
+          out="oj-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$out"
+          cp "target/${{ matrix.target }}/release/oj" "$out/oj"
+          tar -C "$out" -czf "$out.tar.gz" oj
+          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oj-linux-${{ matrix.arch }}
+          path: |
+            oj-*.tar.gz
+            oj-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # One release for the tag, with both builds attached. The tag already exists
+  # (the script pushed it); this only fills in the release. Re-runs clobber the
+  # assets instead of failing on an existing release.
+  release:
+    name: github release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create the release with the binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Same CHANGELOG-section extraction upstream's release.yml uses,
+            # so the fork release notes match the upstream release.
+            awk -v ver="$ver" '$0 ~ "^## \\[" ver "\\]" {f=1; next} /^## \[/ {f=0} f' \
+              CHANGELOG.md > notes.md
+            if [ -s notes.md ]; then
+              gh release create "$GITHUB_REF_NAME" \
+                --title "oj $GITHUB_REF_NAME" --notes-file notes.md --latest=false
+            else
+              gh release create "$GITHUB_REF_NAME" \
+                --title "oj $GITHUB_REF_NAME" --generate-notes --latest=false
+            fi
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          # The daily sync can release several tags in one run and their
+          # workflows race. GitHub would otherwise mark whichever was
+          # *published* last as "Latest" (v0.2.38 beat v0.2.39 that way), so
+          # never let create claim it and let only the highest semver release
+          # take it. Re-running this job also repairs a wrong label.
+          latest="$(gh release list --limit 200 --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName' | sed '/^$/d' | sort -V | tail -1)"
+          if [ "$latest" = "$GITHUB_REF_NAME" ]; then
+            gh release edit "$GITHUB_REF_NAME" --latest
+          fi
+          ls -l dist
