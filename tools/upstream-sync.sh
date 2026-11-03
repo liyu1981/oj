@@ -107,7 +107,10 @@ else
     # next iteration starts from the branch that carries this script.
     git checkout -q "$HOME_BRANCH"
     log "releasing $tag"
-    ./tools/prebuild-release.sh "$tag"
+    if ! ./tools/prebuild-release.sh "$tag"; then
+      log "warning: failed to release $tag; skipping (see above)"
+      continue
+    fi
   done
 fi
 
